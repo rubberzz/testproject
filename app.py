@@ -27,17 +27,90 @@ CORS(
 
 @app.after_request
 def add_cors_headers(response):
-    response.headers.setdefault("Access-Control-Allow-Origin", "*")
-    response.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-    response.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
-    response.headers.setdefault("Access-Control-Expose-Headers", "Content-Disposition, Content-Type")
-    return response
+    return make_cors_response(response)
+
+
+@app.before_request
+def handle_preflight_options():
+    # Some blob/usercontent preview origins send an OPTIONS preflight before
+    # multipart uploads. Answer it explicitly so the browser does not report
+    # an opaque "TypeError: Failed to fetch".
+    if request.method == "OPTIONS":
+        response = app.make_default_options_response()
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+        response.headers["Access-Control-Max-Age"] = "86400"
+        return response
+
+
+def compact_product_for_frontend(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Return only fields the dashboard needs.
+
+    The previous JSON response was about 5 MB for the Lasher workbook. Some
+    browser preview/sandbox environments fail large cross-origin POST responses
+    as a generic `TypeError: Failed to fetch`. Keeping the response slim makes
+    uploads much more reliable while preserving all export-relevant fields.
+    """
+    keep = [
+        "_uid",
+        "product_id",
+        "product_name",
+        "description",
+        "selling_price",
+        "calculated_price",
+        "cost_price",
+        "category",
+        "brand",
+        "barcode",
+        "sku",
+        "variant_enabled",
+        "attr1_name",
+        "attr1_val",
+        "attr2_name",
+        "attr2_val",
+        "attr3_name",
+        "attr3_val",
+        "image_url",
+        "source_sheet",
+        "source_row",
+        "unique_id",
+        "composite_key",
+        "category_code_key",
+    ]
+    out: Dict[str, Any] = {}
+    for key in keep:
+        value = row.get(key)
+        if value is None:
+            continue
+        if isinstance(value, float) and math.isnan(value):
+            continue
+        if value == "":
+            continue
+        out[key] = value
+    return out
+
+
+def compact_conflict_for_frontend(conflict: Dict[str, Any]) -> Dict[str, Any]:
+    out = {
+        key: conflict.get(key)
+        for key in ["conflict_id", "code", "title", "category", "reason"]
+        if conflict.get(key) not in (None, "")
+    }
+    out["options"] = [compact_product_for_frontend(option) for option in conflict.get("options", [])]
+    return out
+
 
 @app.errorhandler(Exception)
 def handle_unexpected_error(exc):
     # Always return JSON + CORS instead of letting the connection die silently.
+    import traceback
     app.logger.exception("Unhandled backend error")
-    return jsonify({"error": str(exc), "type": exc.__class__.__name__}), 500
+    return cors_json({
+        "error": str(exc),
+        "type": exc.__class__.__name__,
+        "traceback_tail": traceback.format_exc().splitlines()[-12:],
+    }, 500)
 
 
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "50"))
@@ -46,6 +119,24 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 # Lightweight in-memory store for conflict choices from the frontend.
 # For production you can replace this with Firestore/Postgres/S3/etc.
 PRICE_CONFLICT_DECISIONS: Dict[str, Dict[str, Any]] = {}
+
+
+
+def make_cors_response(response):
+    """Force CORS headers on every response, including error responses."""
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+    response.headers["Access-Control-Expose-Headers"] = "Content-Disposition, Content-Type"
+    response.headers["Access-Control-Max-Age"] = "86400"
+    return response
+
+
+def cors_json(payload: Dict[str, Any], status_code: int = 200):
+    response = jsonify(payload)
+    response.status_code = status_code
+    return make_cors_response(response)
+
 
 YOCO_PRODUCTS_COLUMNS = [
     "Product ID",
@@ -1284,6 +1375,32 @@ def health():
     return jsonify({"status": "ok", "service": "Yoco retail file processor"})
 
 
+
+
+@app.post("/debug-upload")
+def debug_upload():
+    """Tiny upload diagnostic endpoint.
+
+    Use this to confirm whether the browser can POST the selected file to Render
+    at all. It does not parse the workbook, so any failure here is CORS, request
+    size, network, or Render routing rather than parser code.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded. Use multipart field name 'file'."}), 400
+    uploaded_file = request.files["file"]
+    stream = uploaded_file.stream
+    pos = stream.tell()
+    stream.seek(0, os.SEEK_END)
+    size = stream.tell()
+    stream.seek(pos)
+    return jsonify({
+        "status": "ok",
+        "filename": uploaded_file.filename,
+        "bytes": size,
+        "maxUploadMB": MAX_UPLOAD_MB,
+    })
+
+
 @app.post("/process-retail-file-json")
 def process_retail_file_json():
     if "file" not in request.files:
@@ -1300,14 +1417,26 @@ def process_retail_file_json():
             "errors": sum(1 for i in issues if i["level"] == "error"),
             "warnings": sum(1 for i in issues if i["level"] == "warning"),
         })
+        # Return a compact payload by default. This prevents large cross-origin
+        # POST responses from being reported by browsers as opaque
+        # `TypeError: Failed to fetch` errors.
         return jsonify({
-            "products": products,
-            "price_conflicts": payload.get("price_conflicts", []),
+            "products": [compact_product_for_frontend(row) for row in products],
+            "price_conflicts": [
+                compact_conflict_for_frontend(conflict)
+                for conflict in payload.get("price_conflicts", [])
+            ],
             "issues": issues,
             "summary": summary,
         })
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        import traceback
+        app.logger.exception("process-retail-file-json failed")
+        return cors_json({
+            "error": str(exc),
+            "type": exc.__class__.__name__,
+            "traceback_tail": traceback.format_exc().splitlines()[-12:],
+        }, 500)
 
 
 @app.post("/process-retail-file")
@@ -1333,7 +1462,13 @@ def process_retail_file_xlsx():
             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        import traceback
+        app.logger.exception("process-retail-file failed")
+        return cors_json({
+            "error": str(exc),
+            "type": exc.__class__.__name__,
+            "traceback_tail": traceback.format_exc().splitlines()[-12:],
+        }, 500)
 
 
 @app.post("/export-yoco-file")
