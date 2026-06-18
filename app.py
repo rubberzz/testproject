@@ -276,6 +276,16 @@ def row_uid(row: Dict[str, Any], index: int) -> str:
 
 
 def best_code(row: Dict[str, Any]) -> str:
+    """Return the best available code/barcode for a row.
+
+    Performance note: this function is called thousands of times during preflight.
+    Cache the result on the row so we do not repeatedly clean/sort/regex the same
+    values. Also avoid sorted() because max() is cheaper and enough here.
+    """
+    cached = row.get("_best_code")
+    if isinstance(cached, str):
+        return cached
+
     candidates = [
         row.get("barcode"),
         row.get("sku"),
@@ -284,15 +294,34 @@ def best_code(row: Dict[str, Any]) -> str:
         row.get("SKU"),
         row.get("Product Code"),
         row.get("Code"),
+        row.get("product_code"),
+        row.get("manufacturing_code"),
     ]
-    cleaned = [clean_code(c) for c in candidates if clean_code(c)]
+
+    cleaned: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        c = clean_code(candidate)
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        cleaned.append(c)
+
     if not cleaned:
+        row["_best_code"] = ""
         return ""
-    # Prefer the longest code because scannable barcodes are usually longest.
-    return sorted(cleaned, key=lambda c: (len(re.sub(r"\D", "", c)), len(c)), reverse=True)[0]
+
+    # Prefer the longest numeric/scannable code, then longest overall string.
+    # Use str(c) defensively because pandas/numpy scalars can leak into rows.
+    best = max(cleaned, key=lambda c: (sum(ch.isdigit() for ch in str(c)), len(str(c))))
+    row["_best_code"] = str(best)
+    return row["_best_code"]
 
 
 def get_price(row: Dict[str, Any]) -> float:
+    cached = row.get("_price")
+    if isinstance(cached, (int, float)) and not (isinstance(cached, float) and math.isnan(cached)):
+        return float(cached)
     for key in ["calculated_price", "selling_price", "variant_price", "Default Price", "Variant Price", "price"]:
         if key in row and normalise_text(row.get(key)) != "":
             price = parse_money(row.get(key))
@@ -302,6 +331,9 @@ def get_price(row: Dict[str, Any]) -> float:
 
 
 def get_cost(row: Dict[str, Any]) -> float:
+    cached = row.get("_cost")
+    if isinstance(cached, (int, float)) and not (isinstance(cached, float) and math.isnan(cached)):
+        return float(cached)
     for key in ["cost_price", "Default Cost Price", "cost", "ex_vat", "Ex VAT"]:
         if key in row and normalise_text(row.get(key)) != "":
             return parse_money(row.get(key))
@@ -328,13 +360,15 @@ def set_title(row: Dict[str, Any], value: str) -> None:
 
 
 def category_code_key(row: Dict[str, Any]) -> str:
-    """Composite identity for supplier/manufacturing codes inside category blocks.
+    """Composite identity: active category + code.
 
-    The same manufacturing code can appear in multiple category sections, for example
-    Palisade / SEA04005006 and Angle Iron / SEA04005006. Those are separate retail
-    items even though the code is identical, so all collision/dedupe logic must use
-    category + code rather than code alone.
+    Uses cached values where possible so duplicate/conflict checks do not repeatedly
+    recompute the same expensive code lookup.
     """
+    cached = row.get("category_code_key") or row.get("composite_key") or row.get("unique_id")
+    if isinstance(cached, str) and cached:
+        return cached
+
     category = normalise_text(
         row.get("active_category")
         or row.get("_active_category")
@@ -344,10 +378,14 @@ def category_code_key(row: Dict[str, Any]) -> str:
         or row.get("source_sheet")
         or row.get("Source Sheet")
     )
-    code = clean_code(best_code(row)).lower()
+    code = clean_code(row.get("_best_code") or best_code(row)).lower()
     if not code:
         return ""
-    return f"{slugify(category) or 'uncategorised'}_{code}"
+    key = f"{slugify(category) or 'uncategorised'}_{code}"
+    row["category_code_key"] = key
+    row["composite_key"] = key
+    row["unique_id"] = key
+    return key
 
 
 def set_category_code_identity(row: Dict[str, Any], category: str = "") -> None:
@@ -389,10 +427,11 @@ def looks_like_category_cell(value: str, row_title: str) -> bool:
     return True
 
 def true_duplicate_key(row: Dict[str, Any]) -> Tuple[str, str, str, float, float]:
+    code = clean_code(row.get("_best_code") or best_code(row)).lower()
     return (
-        category_code_key(row) or clean_code(best_code(row)).lower(),
+        category_code_key(row) or code,
         normalise_for_compare(title_value(row)),
-        clean_code(best_code(row)).lower(),
+        code,
         round(get_price(row), 2),
         round(get_cost(row), 2),
     )
@@ -485,7 +524,7 @@ def split_price_conflicts(products: List[Dict[str, Any]]) -> Tuple[List[Dict[str
     """
     by_identity: Dict[str, List[Dict[str, Any]]] = {}
     for row in products:
-        identity = category_code_key(row)
+        identity = row.get("category_code_key") or row.get("composite_key") or category_code_key(row)
         if not identity:
             continue
         by_identity.setdefault(identity, []).append(row)
@@ -495,7 +534,7 @@ def split_price_conflicts(products: List[Dict[str, Any]]) -> Tuple[List[Dict[str
     for group_index, rows in enumerate(by_identity.values()):
         if len(rows) < 2:
             continue
-        code = best_code(rows[0])
+        code = rows[0].get("_best_code") or best_code(rows[0])
         if not is_price_conflict_code_eligible(code, rows):
             continue
         price_cost_signatures = {
@@ -542,29 +581,29 @@ def preflight_products_payload(products: List[Dict[str, Any]]) -> Dict[str, Any]
 def preflight_products_for_frontend(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Clean product rows before returning them to the frontend.
 
-    1. True dedupe: if title + code + price + cost are identical, keep first only.
-    2. SKU/code enrichment: if duplicate generic product_id rows have different codes,
-       append code to title and product_id so they become unique.
-    3. Adds stable _uid for frontend actions. The frontend should use _uid for edits/removals,
-       never product_id, because product_id can be edited by the user.
+    Hardened for large workbooks: cache code/price/cost/product_id values so the
+    route does not time out while repeatedly running regex/sorting over 5k+ rows.
     """
     deduped: List[Dict[str, Any]] = []
     seen_true_duplicates = set()
 
     for index, original in enumerate(products):
         row = dict(original)
-        title = title_value(row)
+
+        # Compute expensive fields once per row and cache them.
         code = best_code(row)
+        row["_best_code"] = code
+        title = title_value(row)
         price = get_price(row)
         cost = get_cost(row)
+        row["_price"] = price
+        row["_cost"] = cost
 
         if code:
             row["barcode"] = row.get("barcode") or code
             row["Barcode"] = row.get("Barcode") or code
             row["sku"] = row.get("sku") or row.get("SKU") or code
             row["SKU"] = row.get("SKU") or row.get("sku") or code
-
-        set_category_code_identity(row)
 
         if title:
             set_title(row, title)
@@ -575,6 +614,12 @@ def preflight_products_for_frontend(products: List[Dict[str, Any]]) -> List[Dict
         row["selling_price"] = price
         row["calculated_price"] = price
         row["cost_price"] = cost
+
+        # Composite category+code identity is cached here.
+        set_category_code_identity(row)
+
+        if not normalise_text(row.get("_uid")):
+            row["_uid"] = row_uid(row, index)
 
         key = true_duplicate_key(row)
         # Only dedupe if we have at least a title and code. Otherwise keep for user review.
@@ -589,61 +634,30 @@ def preflight_products_for_frontend(products: List[Dict[str, Any]]) -> List[Dict
         variant_enabled = normalise_text(row.get("variant_enabled") or row.get("Variant Enabled")).lower()
         if variant_enabled == "yes":
             continue
-        pid = product_id_value(row)
-        if not pid:
-            continue
-        groups.setdefault(pid.lower(), []).append(row)
+        pid = product_id_value(row).lower()
+        if pid:
+            groups.setdefault(pid, []).append(row)
 
     for _pid, rows in groups.items():
         if len(rows) <= 1:
             continue
-
-        codes = {clean_code(best_code(row)).lower() for row in rows if clean_code(best_code(row))}
+        codes = {clean_code(row.get("_best_code") or best_code(row)).lower() for row in rows if clean_code(row.get("_best_code") or best_code(row))}
         if len(codes) <= 1:
-            # Same product_id and same/blank code. If not true duplicates, keep for frontend review.
             continue
-
-        # Same generic product_id but different manufacturing/barcode/SKU codes.
-        # Make each row unique by appending code to title and slug.
-        used_ids = set()
         for row in rows:
-            code = clean_code(best_code(row))
+            code = clean_code(row.get("_best_code") or best_code(row))
             if not code:
                 continue
-
             title = title_value(row)
-            code_norm = normalise_for_compare(code)
-            title_norm = normalise_for_compare(title)
-
-            if code_norm and code_norm not in title_norm:
-                new_title = f"{title} - {code}" if title else code
-                set_title(row, new_title)
-            else:
-                new_title = title
-
-            base_slug = slugify(new_title)
+            if code.lower() not in title.lower():
+                set_title(row, f"{title} - {code}".strip(" -"))
+            base_pid = product_id_value(row) or slugify(title_value(row))
             code_slug = slugify(code)
-            new_pid = base_slug
-            if code_slug and not new_pid.endswith(code_slug):
-                new_pid = f"{new_pid}-{code_slug}"
-            new_pid = re.sub(r"-+", "-", new_pid).strip("-")
-
-            original_pid = new_pid
-            counter = 2
-            while new_pid in used_ids:
-                new_pid = f"{original_pid}-{counter}"
-                counter += 1
-            used_ids.add(new_pid)
-            set_product_id(row, new_pid)
-
-    # Add stable IDs after dedupe/enrichment.
-    for index, row in enumerate(deduped):
-        row["_uid"] = row.get("_uid") or row_uid(row, index)
-        row["_preflighted"] = True
+            if code_slug and not base_pid.endswith("-" + code_slug) and base_pid != code_slug:
+                set_product_id(row, f"{base_pid}-{code_slug}")
+            # Product ID changed; refresh composite key remains category+code, not product ID.
 
     return deduped
-
-
 
 
 def enrich_remaining_duplicate_product_ids(products: List[Dict[str, Any]]) -> int:
