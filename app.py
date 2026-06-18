@@ -818,24 +818,49 @@ def normalise_header(header: Any) -> str:
     return normalise_for_compare(header)
 
 
+# Column mapping is called for every row, but a sheet has the same headers for
+# thousands of rows. Cache by the header tuple and pre-normalise aliases once.
+# This avoids the worker spending seconds repeatedly normalising headers/aliases.
+_COLUMN_ALIAS_NORMS = {
+    canonical: tuple(x for x in (normalise_header(a) for a in aliases) if x)
+    for canonical, aliases in COLUMN_ALIASES.items()
+}
+_MAP_COLUMNS_CACHE: Dict[Tuple[str, ...], Dict[str, str]] = {}
+
+
 def map_columns(columns: List[Any]) -> Dict[str, str]:
-    header_map = {normalise_header(c): c for c in columns}
+    key = tuple(normalise_text(c) for c in columns)
+    cached = _MAP_COLUMNS_CACHE.get(key)
+    if cached is not None:
+        return dict(cached)
+
+    header_map = {normalise_header(c): c for c in columns if normalise_header(c)}
     mapped: Dict[str, str] = {}
 
-    for canonical, aliases in COLUMN_ALIASES.items():
-        for alias in aliases:
-            alias_norm = normalise_header(alias)
-            if alias_norm in header_map:
-                mapped[canonical] = header_map[alias_norm]
+    for canonical, alias_norms in _COLUMN_ALIAS_NORMS.items():
+        # Exact match first.
+        for alias_norm in alias_norms:
+            original = header_map.get(alias_norm)
+            if original is not None:
+                mapped[canonical] = original
                 break
         if canonical in mapped:
             continue
-        # Fuzzy contains match as fallback.
+
+        # Fuzzy contains match as fallback. This is intentionally simple and
+        # uses pre-normalised aliases so it does not rebuild lists per row.
         for h_norm, original in header_map.items():
-            if any(alias_norm in h_norm for alias_norm in [normalise_header(a) for a in aliases] if alias_norm):
-                mapped[canonical] = original
+            matched = False
+            for alias_norm in alias_norms:
+                if alias_norm in h_norm:
+                    mapped[canonical] = original
+                    matched = True
+                    break
+            if matched:
                 break
 
+    if len(_MAP_COLUMNS_CACHE) < 256:
+        _MAP_COLUMNS_CACHE[key] = dict(mapped)
     return mapped
 
 
