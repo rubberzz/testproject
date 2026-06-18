@@ -509,11 +509,24 @@ def looks_like_category_cell(value: str, row_title: str) -> bool:
         return False
     return True
 
-def true_duplicate_key(row: Dict[str, Any]) -> Tuple[str, str, str, float, float]:
+def true_duplicate_key(row: Dict[str, Any]) -> Tuple[str, str, str, str, float, float]:
+    """Identity for true duplicate removal.
+
+    Earlier versions only deduped rows that had a barcode/code. That left
+    duplicated no-code rows in sectioned price lists, and the later duplicate-ID
+    fixer made their product names ugly by appending source context and row
+    numbers. A true duplicate can still be safely removed without a code when
+    category + title + variant value + price + cost are identical.
+    """
     code = clean_code(row.get("_best_code") or best_code(row)).lower()
+    category = normalise_text(row.get("active_category") or row.get("_active_category") or row.get("category") or row.get("Category") or row.get("source_sheet") or row.get("Source Sheet"))
+    title_key = normalise_for_compare(title_value(row))
+    variant_key = normalise_for_compare(variant_label_for_row(row)) if row_is_variant(row) else ""
+    identity = category_code_key(row) or code or f"{slugify(category) or 'uncategorised'}_{title_key}"
     return (
-        category_code_key(row) or code,
-        normalise_for_compare(title_value(row)),
+        identity,
+        title_key,
+        variant_key,
         code,
         round(get_price(row), 2),
         round(get_cost(row), 2),
@@ -792,10 +805,13 @@ def enrich_remaining_duplicate_product_ids(products: List[Dict[str, Any]]) -> in
                 bits.append(f"R{price:.2f}")
             bits.append(f"row {row.get('source_row') or index + 1}")
             suffix = " ".join([b for b in bits if b]).strip()
-            new_title = f"{title} - {suffix}" if suffix and normalise_for_compare(suffix) not in normalise_for_compare(title) else title
-            new_title = re.sub(r"\s+", " ", new_title).strip()
+            # Keep the visible product name clean. Only the Product ID needs a
+            # disambiguating suffix for Yoco uniqueness. Previous versions
+            # appended source_context/price/row into product_name, which created
+            # ugly names like "Strongbow ... - sectioned table block ...".
+            new_title = title
             set_title(row, new_title)
-            base_pid = slugify(new_title)
+            base_pid = slugify(f"{title} {suffix}" if suffix else title)
             new_pid = base_pid
             counter = 2
             while new_pid in used_ids:
@@ -905,25 +921,94 @@ def normalise_existing_variant_default_prices(products: List[Dict[str, Any]]) ->
             row["calculated_price"] = actual if actual > 0 else default_price
 
 
-def infer_variant_from_title(title: str) -> Optional[Tuple[str, str, str]]:
-    """Return (base_title, attribute_name, value) for safe title patterns."""
+# Common flavour/option vocabulary used by generic variant inference.
+# This is intentionally broad retail language, not supplier/file-name specific.
+_FLAVOUR_PHRASES = {
+    "blackberry", "watermelon", "cranberry", "hawian", "hawaiian", "margarita",
+    "peach", "pina colada", "strawberry", "tropical", "apple", "green apple",
+    "gold apple", "red berries", "red berry", "berries red", "berry red", "ruby",
+    "ruby apple", "manic mango", "mango", "orange", "lemon", "pressed lemon",
+    "dry lemon", "tonic", "pink tonic", "pink & tonic",
+    "cola", "mojito", "guarana", "rose spritzer", "wild berry", "berry",
+    "classic", "blush", "mimosa", "sweet red", "sweet rose", "sweet white",
+    "red", "rose", "white", "natural sweet rose", "natural s/rose",
+    "punch ice", "punch peach", "punch tequila", "ice", "tequila",
+}
+
+_SIZE_RE = re.compile(r"\b\d+(?:[,.]\d+)?\s*(?:ml|l|litre|liter|g|kg|mm|cm|m)\b", re.I)
+_TRAILING_SIZE_RE = re.compile(r"\b\d+(?:[,.]\d+)?\s*(?:ml|l|litre|liter|g|kg|mm|cm|m)\s*$", re.I)
+
+
+def clean_option_base(base: str) -> str:
+    base = normalise_text(base)
+    base = re.sub(r"\s+(?:&|and)\s*$", "", base, flags=re.I).strip()
+    return base
+
+
+def infer_flavour_variant_from_title(title: str) -> Optional[Tuple[str, str, str]]:
+    """Infer flavour/option variants from names like 'Breezer Blackberry 440ml'.
+
+    The size remains part of the base title so Yoco sees one product with
+    different flavour values, e.g.:
+      Breezer Blackberry 440ml + Breezer Watermelon 440ml
+      -> product 'Breezer 440ml', Attribute 'Flavour'.
+
+    We only emit candidates for known retail option/flavour phrases. The global
+    grouping step then requires at least two rows with the same base and distinct
+    values before any row is converted to a variant, so standalone products stay
+    standalone.
+    """
     title = normalise_text(title)
     if not title:
         return None
+    size_match = _TRAILING_SIZE_RE.search(title)
+    if not size_match:
+        return None
+    size = size_match.group(0).strip()
+    before_size = title[:size_match.start()].strip(" -·•,/\\")
+    if not before_size:
+        return None
+
+    # Longest phrase first so 'red berries' wins over 'berries'.
+    for phrase in sorted(_FLAVOUR_PHRASES, key=len, reverse=True):
+        pattern = r"(?:^|\s|&|/)" + re.escape(phrase) + r"\s*$"
+        m = re.search(pattern, before_size, flags=re.I)
+        if not m:
+            continue
+        option = before_size[m.start():].strip(" &/-")
+        base = clean_option_base(before_size[:m.start()])
+        if len(base) < 2 or not option:
+            continue
+        # Avoid turning product families like 'Castle Lager 500ml' into variants;
+        # 'lager/lite/stout/dry/gold' are deliberately not in the phrase list.
+        return f"{base} {size}".strip(), "Flavour", option
+    return None
+
+
+def variant_candidates_from_title(title: str) -> List[Tuple[str, str, str, str]]:
+    """Return possible variant parses as (base, attribute, value, kind)."""
+    title = normalise_text(title)
+    if not title:
+        return []
+    candidates: List[Tuple[str, str, str, str]] = []
 
     dash = re.match(r"^(.{3,}?)\s+-\s+(.{1,40})$", title)
     if dash:
         base = dash.group(1).strip()
         value = dash.group(2).strip()
         if base and value and not parse_money(value):
-            return base, "Option", value
+            candidates.append((base, "Option", value, "dash"))
 
     clothing = re.search(r"\b(XXXL|XXL|XL|XS|S|M|L|Small|Medium|Large|Extra Large)\b$", title, flags=re.I)
     if clothing:
         value = clothing.group(1).strip()
         base = title[:clothing.start()].strip(" -·•,/\\")
         if len(base) >= 3:
-            return base, "Size", value
+            candidates.append((base, "Size", value, "clothing-size"))
+
+    flavour = infer_flavour_variant_from_title(title)
+    if flavour:
+        candidates.append((flavour[0], flavour[1], flavour[2], "flavour"))
 
     size_pattern = r"(?:(?:\d+(?:[,.]\d+)?\s*(?:ml|l|litre|liter|g|kg|mm|cm|m))|(?:\d+(?:\s*[x×*]\s*\d+)+(?:\s*(?:mm|cm|m))?)|(?:x\s*\d+\s*(?:pack|pcs|units?)?))$"
     size = re.search(size_pattern, title, flags=re.I)
@@ -931,42 +1016,72 @@ def infer_variant_from_title(title: str) -> Optional[Tuple[str, str, str]]:
         value = size.group(0).strip()
         base = title[:size.start()].strip(" -·•,/\\")
         if len(base) >= 3 and normalise_for_compare(base) != normalise_for_compare(title):
-            return base, "Size", value
-    return None
+            candidates.append((base, "Size", value, "size"))
+    return candidates
+
+
+def infer_variant_from_title(title: str) -> Optional[Tuple[str, str, str]]:
+    candidates = variant_candidates_from_title(title)
+    if not candidates:
+        return None
+    base, attr, value, _kind = candidates[0]
+    return base, attr, value
 
 
 def infer_variants_from_titles(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Variant mode for generic spreadsheet rows; conservative grouping only."""
-    candidates: Dict[Tuple[str, str, str], List[Tuple[Dict[str, Any], str]]] = {}
+    """Variant mode for generic spreadsheet rows.
+
+    This now supports both classic size variants and embedded flavour variants.
+    It builds all safe candidate groups first, then applies only groups that have
+    multiple rows and multiple values. This avoids the old issue where
+    'Breezer Blackberry 440ml' was treated as a standalone size product instead
+    of a Breezer flavour variant, while still allowing 'Autumn Rose 1.5L/750ml'
+    to become a Size variant.
+    """
+    candidate_groups: Dict[Tuple[str, str, str], List[Tuple[Dict[str, Any], str, str, str]]] = {}
+
     for row in products:
-        # Do not infer variants from rows that were already in Yoco's Products
-        # import/export template. In that format Variant Enabled is explicit;
-        # a single item named "Belgravia ... 660ml" must remain a single item.
         if normalise_text(row.get("source_context")).lower().startswith("yoco products"):
             continue
         if row_is_variant(row):
             continue
-        parsed = infer_variant_from_title(title_value(row))
-        if not parsed:
-            continue
-        base, attr_name, attr_value = parsed
-        category_key = normalise_for_compare(row.get("category") or row.get("Category"))
-        candidates.setdefault((category_key, normalise_for_compare(base), attr_name), []).append((row, attr_value))
+        title = title_value(row)
+        for base, attr_name, attr_value, kind in variant_candidates_from_title(title):
+            category_key = normalise_for_compare(row.get("category") or row.get("Category"))
+            key = (category_key, normalise_for_compare(base), attr_name)
+            candidate_groups.setdefault(key, []).append((row, attr_value, base, kind))
 
-    for (_category_key, _base_key, attr_name), rows in candidates.items():
+    valid_groups: List[Tuple[int, int, Tuple[str, str, str], List[Tuple[Dict[str, Any], str, str, str]]]] = []
+    kind_priority = {"dash": 0, "flavour": 1, "clothing-size": 2, "size": 3}
+    for key, rows in candidate_groups.items():
         if len(rows) <= 1:
             continue
-        values = [normalise_for_compare(value) for _, value in rows if value]
+        values = [normalise_for_compare(value) for _, value, _, _ in rows if value]
         if len(set(values)) <= 1:
             continue
-        parsed = infer_variant_from_title(title_value(rows[0][0]))
-        if not parsed:
+        best_kind = min(kind_priority.get(kind, 9) for _, _, _, kind in rows)
+        valid_groups.append((-len(rows), best_kind, key, rows))
+
+    # Larger groups first, then more explicit patterns. A row can only belong to
+    # one inferred group.
+    assigned: set = set()
+    for _neg_size, _priority, _key, rows in sorted(valid_groups, key=lambda item: (item[0], item[1])):
+        rows = [(row, value, base, kind) for row, value, base, kind in rows if id(row) not in assigned]
+        if len(rows) <= 1:
             continue
-        base_title = parsed[0]
-        prices = [get_price(row) for row, _ in rows if get_price(row) > 0]
+        values = [normalise_for_compare(value) for _, value, _, _ in rows]
+        if len(set(values)) <= 1:
+            continue
+        attr_name = _key[2]
+        # Prefer the most common/canonical base spelling inside the group.
+        base_counts: Dict[str, int] = {}
+        for _row, _value, base, _kind in rows:
+            base_counts[base] = base_counts.get(base, 0) + 1
+        base_title = sorted(base_counts.items(), key=lambda item: (-item[1], len(item[0])))[0][0]
+        prices = [get_price(row) for row, _value, _base, _kind in rows if get_price(row) > 0]
         default_price = round(min(prices), 2) if prices else 0.0
         base_pid = slugify(base_title)
-        for row, value in rows:
+        for row, value, _base, _kind in rows:
             actual_price = get_price(row)
             set_title(row, base_title)
             set_product_id(row, base_pid)
@@ -979,6 +1094,7 @@ def infer_variants_from_titles(products: List[Dict[str, Any]]) -> List[Dict[str,
             row["attr3_val"] = row["Value 3"] = ""
             row["selling_price"] = default_price if default_price > 0 else actual_price
             row["calculated_price"] = actual_price if actual_price > 0 else default_price
+            assigned.add(id(row))
     return products
 
 
