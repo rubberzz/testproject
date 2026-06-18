@@ -867,6 +867,154 @@ def row_from_dataframe_record(record: Dict[str, Any], source_sheet: str, index: 
     return row
 
 
+
+
+def row_has_price_metrics(row: Dict[str, Any]) -> bool:
+    """Return True when this parsed row looks like a real sellable product row.
+
+    Category-heading rows such as "Lintels" or "Cement" usually have a title
+    but no selling price, no cost, no barcode/SKU, and no variant fields. Those
+    should be used as state, not exported as products.
+    """
+    return get_price(row) > 0 or get_cost(row) > 0
+
+
+def row_has_identity_code(row: Dict[str, Any]) -> bool:
+    return bool(best_code(row) or normalise_text(row.get("sku") or row.get("SKU")))
+
+
+def row_has_variant_or_description(row: Dict[str, Any]) -> bool:
+    fields = [
+        "description", "Description",
+        "attr1_name", "attr1_val", "attr2_name", "attr2_val", "attr3_name", "attr3_val",
+        "Attribute 1", "Value 1", "Attribute 2", "Value 2", "Attribute 3", "Value 3",
+    ]
+    return any(normalise_text(row.get(f)) for f in fields)
+
+
+def is_category_heading_row(row: Dict[str, Any]) -> bool:
+    """Detect block heading rows that should not become products.
+
+    Example source layout:
+        Lintels
+        150mm x 3m     R160,00
+        115mm x 3m     R125,00
+
+    "Lintels" is a category state. The priced rows become:
+        Lintels - 150mm x 3m
+        Lintels - 115mm x 3m
+
+    Guardrails:
+    - Do not classify rows with barcode/SKU as headings.
+    - Do not classify rows with cost/price as headings.
+    - Do not classify rows with variant fields/descriptions as headings.
+    """
+    title = title_value(row)
+    if not title:
+        return False
+    if row_has_price_metrics(row):
+        return False
+    if row_has_identity_code(row):
+        return False
+    if row_has_variant_or_description(row):
+        return False
+    # Headings are generally short labels, not long product descriptions.
+    return len(title) <= 80
+
+
+def apply_category_prefix(row: Dict[str, Any], current_category: str) -> Dict[str, Any]:
+    """Prefix a product title with the active category and rebuild product_id.
+
+    Standalone priced rows still remain products. If there is no active category
+    they pass through unchanged. If the title is already prefixed, do not double
+    prefix it.
+    """
+    category = normalise_text(current_category)
+    title = title_value(row)
+    if not category or not title:
+        return row
+
+    title_norm = normalise_for_compare(title)
+    cat_norm = normalise_for_compare(category)
+    if title_norm == cat_norm or title_norm.startswith(cat_norm + " "):
+        new_title = title
+    else:
+        new_title = f"{category} - {title}"
+
+    set_title(row, new_title)
+    set_product_id(row, slugify(new_title))
+    # Preserve sheet/category if something meaningful already exists, but for
+    # generic sheet names use the detected block heading as category.
+    existing_category = normalise_text(row.get("category") or row.get("Category"))
+    generic_cats = {"", "uncategorised", normalise_text(row.get("source_sheet")).lower()}
+    if existing_category.lower() in generic_cats:
+        row["category"] = category
+    return row
+
+
+def raw_row_is_blank(raw_df: pd.DataFrame, raw_index: int) -> bool:
+    if raw_index not in raw_df.index:
+        return False
+    values = raw_df.loc[raw_index].tolist()
+    return all(not normalise_text(v) for v in values)
+
+
+def blank_gap_between(raw_df: pd.DataFrame, previous_raw_index: Optional[int], current_raw_index: int) -> bool:
+    """True when one or more blank source rows separate two parsed rows.
+
+    This lets a blank row end a category block, so a later standalone priced row
+    like "Prefab Slabs  R79,00" does not incorrectly become "Cement - Prefab Slabs".
+    """
+    if previous_raw_index is None:
+        return False
+    try:
+        start = int(previous_raw_index) + 1
+        end = int(current_raw_index)
+    except Exception:
+        return False
+    if end <= start:
+        return False
+    for ridx in range(start, end):
+        if raw_row_is_blank(raw_df, ridx):
+            return True
+    return False
+
+
+def parse_cleaned_rows_with_category_state(cleaned: pd.DataFrame, raw_df: pd.DataFrame, source_sheet: str) -> List[Dict[str, Any]]:
+    """Parse rows while tracking spreadsheet category blocks.
+
+    Category headings are rows with text but no price/cost/code. They update
+    current_category and are dropped from the product output. Priced rows are
+    kept and, while inside a category block, receive a title prefix and product_id
+    generated from "Category - Item". Blank source rows reset the active category.
+    """
+    parsed: List[Dict[str, Any]] = []
+    current_category = ""
+    previous_raw_index: Optional[int] = None
+
+    for raw_index, series in cleaned.iterrows():
+        if blank_gap_between(raw_df, previous_raw_index, int(raw_index)):
+            current_category = ""
+
+        record = series.to_dict()
+        row = row_from_dataframe_record(record, source_sheet, int(raw_index))
+        previous_raw_index = int(raw_index)
+
+        if not row:
+            continue
+
+        if is_category_heading_row(row):
+            current_category = title_value(row)
+            continue
+
+        if row_has_price_metrics(row):
+            row = apply_category_prefix(row, current_category)
+
+        parsed.append(row)
+
+    return parsed
+
+
 def parse_uploaded_file(file_storage) -> List[Dict[str, Any]]:
     filename = file_storage.filename or "upload"
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
@@ -877,10 +1025,7 @@ def parse_uploaded_file(file_storage) -> List[Dict[str, Any]]:
         raw = file_storage.read()
         df = pd.read_csv(io.BytesIO(raw), dtype=object, header=None)
         cleaned = dataframe_from_sheet(df)
-        for idx, record in enumerate(cleaned.to_dict(orient="records")):
-            row = row_from_dataframe_record(record, "CSV", idx)
-            if row:
-                products.append(row)
+        products.extend(parse_cleaned_rows_with_category_state(cleaned, df, "CSV"))
         return products
 
     if ext in {"xlsx", "xls", "xl"}:
@@ -909,10 +1054,7 @@ def parse_uploaded_file(file_storage) -> List[Dict[str, Any]]:
                 products.extend(parse_headerless_pair_sheet(raw_df, source_sheet))
                 continue
 
-            for idx, record in enumerate(cleaned.to_dict(orient="records")):
-                row = row_from_dataframe_record(record, source_sheet, idx)
-                if row:
-                    products.append(row)
+            products.extend(parse_cleaned_rows_with_category_state(cleaned, normal_df, source_sheet))
             products.extend(inline_products)
         return products
 
