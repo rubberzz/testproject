@@ -644,9 +644,11 @@ def split_price_conflicts(products: List[Dict[str, Any]]) -> Tuple[List[Dict[str
     return remaining, conflicts
 
 
-def preflight_products_payload(products: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Full frontend payload preflight: dedupe, enrich generic IDs, then group price conflicts."""
+def preflight_products_payload(products: List[Dict[str, Any]], parse_mode: Any = "variant") -> Dict[str, Any]:
+    """Full frontend payload preflight: apply mode, dedupe, enrich IDs, then group conflicts."""
+    mode = normalise_parse_mode(parse_mode)
     before_count = len(products)
+    products = apply_parse_mode(products, mode)
     cleaned = preflight_products_for_frontend(products)
     flat_products, price_conflicts = split_price_conflicts(cleaned)
     enriched_remaining_duplicate_ids = enrich_remaining_duplicate_product_ids(flat_products)
@@ -661,6 +663,7 @@ def preflight_products_payload(products: List[Dict[str, Any]]) -> Dict[str, Any]
             "price_conflict_groups": len(price_conflicts),
             "price_conflict_rows": conflict_rows,
             "enriched_remaining_duplicate_ids": enriched_remaining_duplicate_ids,
+            "parse_mode": mode,
         },
     }
 
@@ -697,8 +700,15 @@ def preflight_products_for_frontend(products: List[Dict[str, Any]]) -> List[Dict
         if not product_id_value(row):
             set_product_id(row, slugify(title or code or f"product-{index + 1}"))
 
-        row["selling_price"] = price
-        row["calculated_price"] = price
+        # For variants, selling_price is the product Default Price while
+        # calculated_price is the row/Variant Price. Preserve that distinction.
+        if row_is_variant(row):
+            default_price = parse_money(row.get("selling_price") or row.get("Default Price"))
+            row["selling_price"] = default_price if default_price > 0 else price
+            row["calculated_price"] = price
+        else:
+            row["selling_price"] = price
+            row["calculated_price"] = price
         row["cost_price"] = cost
 
         # Composite category+code identity is cached here.
@@ -796,6 +806,210 @@ def enrich_remaining_duplicate_product_ids(products: List[Dict[str, Any]]) -> in
                 set_product_id(row, new_pid)
                 changed += 1
     return changed
+
+
+
+def normalise_parse_mode(value: Any) -> str:
+    mode = normalise_text(value).lower().strip()
+    if mode in {"single", "singles", "single items", "single_items"}:
+        return "single"
+    return "variant"
+
+
+def row_is_variant(row: Dict[str, Any]) -> bool:
+    return normalise_text(row.get("variant_enabled") or row.get("Variant Enabled")).lower() == "yes"
+
+
+def set_variant_fields(row: Dict[str, Any], enabled: bool) -> None:
+    value = "Yes" if enabled else "No"
+    row["variant_enabled"] = value
+    row["Variant Enabled"] = value
+
+
+def clear_variant_attributes(row: Dict[str, Any]) -> None:
+    for key in [
+        "attr1_name", "attr1_val", "attr2_name", "attr2_val", "attr3_name", "attr3_val",
+        "Attribute 1", "Value 1", "Attribute 2", "Value 2", "Attribute 3", "Value 3",
+    ]:
+        row[key] = ""
+
+
+def variant_label_for_row(row: Dict[str, Any]) -> str:
+    vals = []
+    for idx in range(1, 4):
+        value = normalise_text(row.get(f"attr{idx}_val") or row.get(f"Value {idx}"))
+        if value and value.lower() not in {"default", "default title"}:
+            vals.append(value)
+    return " · ".join(vals)
+
+
+def unique_slug(base: str, used: set, fallback: str = "product") -> str:
+    root = slugify(base) or fallback
+    candidate = root
+    counter = 2
+    while candidate in used:
+        candidate = f"{root}-{counter}"
+        counter += 1
+    used.add(candidate)
+    return candidate
+
+
+def flatten_variants_to_single_items(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Single mode: every row becomes an independent Yoco product."""
+    out: List[Dict[str, Any]] = []
+    used_ids = set()
+    for idx, original in enumerate(products):
+        row = dict(original)
+        title = title_value(row)
+        label = variant_label_for_row(row)
+        if row_is_variant(row) and label and normalise_for_compare(label) not in normalise_for_compare(title):
+            title = f"{title} - {label}".strip(" -")
+            set_title(row, title)
+        set_variant_fields(row, False)
+        clear_variant_attributes(row)
+        price = get_price(row)
+        row["selling_price"] = price
+        row["calculated_price"] = price
+        code = best_code(row)
+        pid_seed = " ".join([title_value(row), code]).strip() or f"product {idx + 1}"
+        set_product_id(row, unique_slug(pid_seed, used_ids, f"product-{idx + 1}"))
+        set_category_code_identity(row)
+        if not normalise_text(row.get("_uid")):
+            row["_uid"] = row_uid(row, idx)
+        out.append(row)
+    return out
+
+
+def variant_group_key(row: Dict[str, Any]) -> str:
+    return "::".join([
+        normalise_for_compare(row.get("category") or row.get("Category")),
+        product_id_value(row).lower() or slugify(title_value(row)),
+    ])
+
+
+def normalise_existing_variant_default_prices(products: List[Dict[str, Any]]) -> None:
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for row in products:
+        if row_is_variant(row):
+            groups.setdefault(variant_group_key(row), []).append(row)
+    for rows in groups.values():
+        if len(rows) <= 1:
+            continue
+        actual_prices = [get_price(row) for row in rows if get_price(row) > 0]
+        if not actual_prices:
+            continue
+        default_price = round(min(actual_prices), 2)
+        for row in rows:
+            actual = get_price(row)
+            row["selling_price"] = default_price
+            row["calculated_price"] = actual if actual > 0 else default_price
+
+
+def infer_variant_from_title(title: str) -> Optional[Tuple[str, str, str]]:
+    """Return (base_title, attribute_name, value) for safe title patterns."""
+    title = normalise_text(title)
+    if not title:
+        return None
+
+    dash = re.match(r"^(.{3,}?)\s+-\s+(.{1,40})$", title)
+    if dash:
+        base = dash.group(1).strip()
+        value = dash.group(2).strip()
+        if base and value and not parse_money(value):
+            return base, "Option", value
+
+    clothing = re.search(r"\b(XXXL|XXL|XL|XS|S|M|L|Small|Medium|Large|Extra Large)\b$", title, flags=re.I)
+    if clothing:
+        value = clothing.group(1).strip()
+        base = title[:clothing.start()].strip(" -·•,/\\")
+        if len(base) >= 3:
+            return base, "Size", value
+
+    size_pattern = r"(?:(?:\d+(?:[,.]\d+)?\s*(?:ml|l|litre|liter|g|kg|mm|cm|m))|(?:\d+(?:\s*[x×*]\s*\d+)+(?:\s*(?:mm|cm|m))?)|(?:x\s*\d+\s*(?:pack|pcs|units?)?))$"
+    size = re.search(size_pattern, title, flags=re.I)
+    if size:
+        value = size.group(0).strip()
+        base = title[:size.start()].strip(" -·•,/\\")
+        if len(base) >= 3 and normalise_for_compare(base) != normalise_for_compare(title):
+            return base, "Size", value
+    return None
+
+
+def infer_variants_from_titles(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Variant mode for generic spreadsheet rows; conservative grouping only."""
+    candidates: Dict[Tuple[str, str, str], List[Tuple[Dict[str, Any], str]]] = {}
+    for row in products:
+        # Do not infer variants from rows that were already in Yoco's Products
+        # import/export template. In that format Variant Enabled is explicit;
+        # a single item named "Belgravia ... 660ml" must remain a single item.
+        if normalise_text(row.get("source_context")).lower().startswith("yoco products"):
+            continue
+        if row_is_variant(row):
+            continue
+        parsed = infer_variant_from_title(title_value(row))
+        if not parsed:
+            continue
+        base, attr_name, attr_value = parsed
+        category_key = normalise_for_compare(row.get("category") or row.get("Category"))
+        candidates.setdefault((category_key, normalise_for_compare(base), attr_name), []).append((row, attr_value))
+
+    for (_category_key, _base_key, attr_name), rows in candidates.items():
+        if len(rows) <= 1:
+            continue
+        values = [normalise_for_compare(value) for _, value in rows if value]
+        if len(set(values)) <= 1:
+            continue
+        parsed = infer_variant_from_title(title_value(rows[0][0]))
+        if not parsed:
+            continue
+        base_title = parsed[0]
+        prices = [get_price(row) for row, _ in rows if get_price(row) > 0]
+        default_price = round(min(prices), 2) if prices else 0.0
+        base_pid = slugify(base_title)
+        for row, value in rows:
+            actual_price = get_price(row)
+            set_title(row, base_title)
+            set_product_id(row, base_pid)
+            set_variant_fields(row, True)
+            row["attr1_name"] = row["Attribute 1"] = attr_name
+            row["attr1_val"] = row["Value 1"] = value
+            row["attr2_name"] = row["Attribute 2"] = ""
+            row["attr2_val"] = row["Value 2"] = ""
+            row["attr3_name"] = row["Attribute 3"] = ""
+            row["attr3_val"] = row["Value 3"] = ""
+            row["selling_price"] = default_price if default_price > 0 else actual_price
+            row["calculated_price"] = actual_price if actual_price > 0 else default_price
+    return products
+
+
+def apply_parse_mode(products: List[Dict[str, Any]], parse_mode: Any) -> List[Dict[str, Any]]:
+    """Apply dashboard Single/Variant mode to Python-backend rows.
+
+    Single: clears all variant attributes and makes every row its own product.
+    Variant: preserves Shopify/Yoco variant rows and groups only obvious title
+    variants, then normalises Yoco default price per variant group.
+    """
+    mode = normalise_parse_mode(parse_mode)
+    if mode == "single":
+        return flatten_variants_to_single_items(products)
+
+    prepared = [dict(row) for row in products]
+    for index, row in enumerate(prepared):
+        # Preserve existing variant attributes from Shopify/Yoco-like exports.
+        if row_is_variant(row) or variant_label_for_row(row):
+            set_variant_fields(row, True)
+        else:
+            set_variant_fields(row, False)
+        if not product_id_value(row):
+            set_product_id(row, slugify(title_value(row) or best_code(row) or f"product-{index + 1}"))
+        if not normalise_text(row.get("_uid")):
+            row["_uid"] = row_uid(row, index)
+
+    infer_variants_from_titles(prepared)
+    normalise_existing_variant_default_prices(prepared)
+    for row in prepared:
+        set_category_code_identity(row)
+    return prepared
 
 def find_header_row(df: pd.DataFrame, max_scan_rows: int = 15) -> int:
     """Find likely header row by scoring known column names."""
@@ -919,6 +1133,92 @@ def choose_cost_price_column(columns: List[Any], mapped: Dict[str, str]) -> Opti
 
 
 
+
+
+
+def is_yoco_products_export_sheet(raw_df: pd.DataFrame) -> bool:
+    """Detect Yoco Products import/export template sheets.
+
+    These have a fixed 25-column header containing Product ID, Product Name,
+    Default Price, Variant Price, Variant Enabled, Attribute 1, Barcode, etc.
+    They must be parsed directly because Default Price and Variant Price have
+    different meanings; a generic price-column selector can collapse variants.
+    """
+    if raw_df.empty:
+        return False
+    required = {"product id", "product name", "default price", "variant price", "variant enabled"}
+    for ridx in range(min(len(raw_df), 10)):
+        headers = {normalise_header(v) for v in raw_df.iloc[ridx].tolist() if normalise_header(v)}
+        if required.issubset(headers):
+            return True
+    return False
+
+
+def find_yoco_header_row(raw_df: pd.DataFrame) -> Optional[int]:
+    required = {"product id", "product name", "default price", "variant price", "variant enabled"}
+    for ridx in range(min(len(raw_df), 10)):
+        headers = {normalise_header(v) for v in raw_df.iloc[ridx].tolist() if normalise_header(v)}
+        if required.issubset(headers):
+            return ridx
+    return None
+
+
+def parse_yoco_products_export_sheet(raw_df: pd.DataFrame, source_sheet: str) -> List[Dict[str, Any]]:
+    """Parse a Yoco Products sheet while preserving variants correctly."""
+    header_idx = find_yoco_header_row(raw_df)
+    if header_idx is None:
+        return []
+    headers = [normalise_text(v) or f"Column {i + 1}" for i, v in enumerate(raw_df.iloc[header_idx].tolist())]
+    data = raw_df.iloc[header_idx + 1:].copy()
+    data.columns = headers
+    hmap = {normalise_header(h): h for h in headers if normalise_header(h)}
+
+    def col(name: str) -> Optional[str]:
+        return hmap.get(normalise_header(name))
+
+    products: List[Dict[str, Any]] = []
+    for offset, (_, series) in enumerate(data.iterrows(), start=header_idx + 2):
+        record = series.to_dict()
+        product_id = normalise_text(record.get(col("Product ID"))) if col("Product ID") else ""
+        product_name = normalise_text(record.get(col("Product Name"))) if col("Product Name") else ""
+        if not product_id and not product_name:
+            continue
+        default_price = parse_money(record.get(col("Default Price"))) if col("Default Price") else 0.0
+        variant_price = parse_money(record.get(col("Variant Price"))) if col("Variant Price") else 0.0
+        price = variant_price or default_price
+        variant_enabled_raw = normalise_text(record.get(col("Variant Enabled"))) if col("Variant Enabled") else ""
+        variant_enabled = "Yes" if variant_enabled_raw.lower() == "yes" else "No"
+        sku = clean_code(record.get(col("SKU"))) if col("SKU") else ""
+        barcode = clean_code(record.get(col("Barcode"))) if col("Barcode") else ""
+        code = barcode or sku
+        row = {
+            "product_id": product_id or slugify(product_name or code or f"product-{offset}"),
+            "product_name": product_name or product_id,
+            "description": normalise_text(record.get(col("Description"))) if col("Description") else "",
+            "category": normalise_text(record.get(col("Category"))) if col("Category") else source_sheet or "Uncategorised",
+            "brand": normalise_text(record.get(col("Brand"))) if col("Brand") else "",
+            "sku": sku or code,
+            "barcode": barcode or code,
+            "selling_price": float(default_price or price),
+            "calculated_price": float(price or default_price),
+            "variant_price": float(price or default_price),
+            "cost_price": parse_money(record.get(col("Default Cost Price"))) if col("Default Cost Price") else 0.0,
+            "image_url": normalise_text(record.get(col("Image URL"))) if col("Image URL") else "",
+            "variant_enabled": variant_enabled,
+            "attr1_name": normalise_text(record.get(col("Attribute 1"))) if col("Attribute 1") else "",
+            "attr1_val": normalise_text(record.get(col("Value 1"))) if col("Value 1") else "",
+            "attr2_name": normalise_text(record.get(col("Attribute 2"))) if col("Attribute 2") else "",
+            "attr2_val": normalise_text(record.get(col("Value 2"))) if col("Value 2") else "",
+            "attr3_name": normalise_text(record.get(col("Attribute 3"))) if col("Attribute 3") else "",
+            "attr3_val": normalise_text(record.get(col("Value 3"))) if col("Value 3") else "",
+            "track_stock": normalise_text(record.get(col("Track Stock"))) if col("Track Stock") else ("Variant" if variant_enabled == "Yes" else "Product"),
+            "source_sheet": source_sheet,
+            "source_row": int(offset),
+            "source_context": "Yoco Products sheet",
+        }
+        set_category_code_identity(row, row.get("category"))
+        products.append(row)
+    return products
 
 def is_shopify_export_sheet(raw_df: pd.DataFrame) -> bool:
     """Detect Shopify product export style sheets.
@@ -1892,6 +2192,12 @@ def parse_uploaded_file(file_storage) -> List[Dict[str, Any]]:
         for sheet_name, raw_df in sheets.items():
             source_sheet = str(sheet_name)
 
+            # Yoco Products sheets are already in final import/export format.
+            # Parse them directly so Default Price and Variant Price are not collapsed.
+            if is_yoco_products_export_sheet(raw_df):
+                products.extend(parse_yoco_products_export_sheet(raw_df, source_sheet))
+                continue
+
             # E-commerce exports such as Shopify are already structured as one
             # row per variant and use repeated blank product-level cells. Parse
             # them before visual-block/headerless heuristics.
@@ -1937,7 +2243,8 @@ def parse_uploaded_file(file_storage) -> List[Dict[str, Any]]:
 
 
 def product_to_yoco_row(row: Dict[str, Any], track_stock: str = "Product", vat_enabled: str = "Yes") -> Dict[str, Any]:
-    price = get_price(row)
+    variant_price = get_price(row)
+    default_price = parse_money(row.get("default_price") or row.get("selling_price") or row.get("Default Price")) or variant_price
     cost = get_cost(row)
     product_id = product_id_value(row) or slugify(title_value(row))
     product_name = title_value(row)
@@ -1945,12 +2252,14 @@ def product_to_yoco_row(row: Dict[str, Any], track_stock: str = "Product", vat_e
 
     variant_enabled = normalise_text(row.get("variant_enabled") or row.get("Variant Enabled"))
     variant_enabled = "Yes" if variant_enabled.lower() == "yes" else "No"
+    if variant_enabled != "Yes":
+        default_price = variant_price
 
     return {
         "Product ID": product_id,
         "Product Name": product_name,
         "Description": normalise_text(row.get("description") or row.get("Description")),
-        "Default Price": price,
+        "Default Price": default_price,
         "Brand": normalise_text(row.get("brand") or row.get("Brand")),
         "Category": normalise_text(row.get("category") or row.get("Category")) or "Uncategorised",
         "SKU": normalise_text(row.get("sku") or row.get("SKU") or code),
@@ -1960,7 +2269,7 @@ def product_to_yoco_row(row: Dict[str, Any], track_stock: str = "Product", vat_e
         "Quantity Units": normalise_text(row.get("quantity_units") or row.get("Quantity Units")),
         "Ask For Price": "No",
         "VAT Enabled": vat_enabled,
-        "Variant Price": price,
+        "Variant Price": variant_price,
         "Variant Enabled": variant_enabled,
         "Attribute 1": normalise_text(row.get("attr1_name") or row.get("Attribute 1")),
         "Value 1": normalise_text(row.get("attr1_val") or row.get("Value 1")),
@@ -2080,8 +2389,9 @@ def process_retail_file_json():
 
     uploaded_file = request.files["file"]
     try:
+        parse_mode = request.form.get("parse_mode", "variant")
         raw_products = parse_uploaded_file(uploaded_file)
-        payload = preflight_products_payload(raw_products)
+        payload = preflight_products_payload(raw_products, parse_mode=parse_mode)
         products = payload["products"]
         issues = build_issues(products)
         summary = dict(payload.get("metadata") or {})
@@ -2123,7 +2433,9 @@ def process_retail_file_xlsx():
 
     uploaded_file = request.files["file"]
     try:
+        parse_mode = request.form.get("parse_mode", "variant")
         raw_products = parse_uploaded_file(uploaded_file)
+        raw_products = apply_parse_mode(raw_products, parse_mode)
         products = preflight_products_for_frontend(raw_products)
         enrich_remaining_duplicate_product_ids(products)
         output = products_to_workbook(products)
@@ -2159,6 +2471,9 @@ def export_yoco_file():
 
     try:
         # Run preflight again as a safety net before export.
+        parse_mode = payload.get("parse_mode")
+        if parse_mode:
+            products = apply_parse_mode(products, parse_mode)
         products = preflight_products_for_frontend(products)
         output = products_to_workbook(products)
         return send_file(
