@@ -77,6 +77,7 @@ def compact_product_for_frontend(row: Dict[str, Any]) -> Dict[str, Any]:
         "unique_id",
         "composite_key",
         "category_code_key",
+        "retail_identity_key",
     ]
     out: Dict[str, Any] = {}
     for key in keep:
@@ -91,13 +92,69 @@ def compact_product_for_frontend(row: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def compact_conflict_option_for_frontend(option: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten a price-conflict option into the same row shape the frontend expects.
+
+    build_price_conflict_payload stores useful values such as price/cost/title at
+    the option wrapper level and the original product at option["row"]. The old
+    compacting function only kept row-like keys, dropping price/cost/title and
+    causing the UI to render R 0.00. This function preserves both.
+    """
+    source_row = option.get("row") if isinstance(option.get("row"), dict) else {}
+    row = dict(source_row)
+
+    uid = normalise_text(option.get("uid") or row.get("_uid"))
+    title = normalise_text(option.get("title") or row.get("product_name") or row.get("Product Name"))
+    price = parse_money(option.get("price") if option.get("price") is not None else row.get("calculated_price") or row.get("selling_price"))
+    cost = parse_money(option.get("cost") if option.get("cost") is not None else row.get("cost_price") or row.get("Default Cost Price"))
+    code = clean_code(option.get("code") or option.get("barcode") or row.get("barcode") or row.get("Barcode") or row.get("sku") or row.get("SKU"))
+
+    if uid:
+        row["_uid"] = uid
+    if title:
+        row["product_name"] = title
+        row["Product Name"] = title
+    if option.get("product_id"):
+        row["product_id"] = option.get("product_id")
+        row["Product ID"] = option.get("product_id")
+    if option.get("category"):
+        row["category"] = option.get("category")
+        row["Category"] = option.get("category")
+    if code:
+        row["barcode"] = code
+        row["Barcode"] = code
+        row["sku"] = row.get("sku") or code
+        row["SKU"] = row.get("SKU") or code
+    row["selling_price"] = price
+    row["calculated_price"] = price
+    row["cost_price"] = cost
+    row["Default Cost Price"] = cost
+    row["unique_id"] = option.get("unique_id") or row.get("unique_id")
+    row["composite_key"] = option.get("composite_key") or row.get("composite_key")
+    row["category_code_key"] = option.get("composite_key") or row.get("category_code_key")
+    row["source_sheet"] = option.get("source_sheet") or row.get("source_sheet")
+    row["source_row"] = option.get("source_row") or row.get("source_row")
+
+    compact = compact_product_for_frontend(row)
+    # Keep wrapper fields too because the existing JS reads option.price/cost/title.
+    compact.update({
+        "uid": uid or compact.get("_uid"),
+        "title": title or compact.get("product_name"),
+        "price": price,
+        "cost": cost,
+        "code": code,
+        "row": compact_product_for_frontend(row),
+    })
+    return compact
+
+
 def compact_conflict_for_frontend(conflict: Dict[str, Any]) -> Dict[str, Any]:
     out = {
         key: conflict.get(key)
-        for key in ["conflict_id", "code", "title", "category", "reason"]
+        for key in ["conflict_id", "code", "title", "category", "reason", "message", "unique_id", "composite_key"]
         if conflict.get(key) not in (None, "")
     }
-    out["options"] = [compact_product_for_frontend(option) for option in conflict.get("options", [])]
+    out["options"] = [compact_conflict_option_for_frontend(option) for option in conflict.get("options", [])]
     return out
 
 
@@ -362,10 +419,10 @@ def set_title(row: Dict[str, Any], value: str) -> None:
 def category_code_key(row: Dict[str, Any]) -> str:
     """Composite identity: active category + code.
 
-    Uses cached values where possible so duplicate/conflict checks do not repeatedly
-    recompute the same expensive code lookup.
+    This is intentionally category-aware so the same supplier/manufacturing code
+    under different sheet/category headers remains a separate retail item.
     """
-    cached = row.get("category_code_key") or row.get("composite_key") or row.get("unique_id")
+    cached = row.get("category_code_key") or row.get("composite_key")
     if isinstance(cached, str) and cached:
         return cached
 
@@ -384,7 +441,26 @@ def category_code_key(row: Dict[str, Any]) -> str:
     key = f"{slugify(category) or 'uncategorised'}_{code}"
     row["category_code_key"] = key
     row["composite_key"] = key
-    row["unique_id"] = key
+    # Keep unique_id at category+code level unless a retail_identity_key is later
+    # set for rows that need title-level separation.
+    row["unique_id"] = row.get("unique_id") or key
+    return key
+
+
+def pricing_conflict_identity(row: Dict[str, Any]) -> str:
+    """Identity used for pricing conflicts: category + code + product title.
+
+    Some supplier sheets reuse the same code for different physical items. We
+    should not ask the user to choose a price between different products. A
+    pricing conflict should only appear when the same category+code+title has
+    conflicting prices/costs.
+    """
+    base = category_code_key(row)
+    title_key = slugify(title_value(row))
+    if not base:
+        return ""
+    key = f"{base}_{title_key}" if title_key else base
+    row["retail_identity_key"] = key
     return key
 
 
@@ -398,6 +474,7 @@ def set_category_code_identity(row: Dict[str, Any], category: str = "") -> None:
         row["unique_id"] = key
         row["composite_key"] = key
         row["category_code_key"] = key
+        row["retail_identity_key"] = pricing_conflict_identity(row)
 
 
 def raw_cell_text(raw_df: pd.DataFrame, raw_index: int, col_index: int) -> str:
@@ -524,7 +601,10 @@ def split_price_conflicts(products: List[Dict[str, Any]]) -> Tuple[List[Dict[str
     """
     by_identity: Dict[str, List[Dict[str, Any]]] = {}
     for row in products:
-        identity = row.get("category_code_key") or row.get("composite_key") or category_code_key(row)
+        # Use title-aware retail identity for conflict detection. The same code
+        # can appear under the same supplier category for different items; those
+        # must remain separate products, not a forced price-choice conflict.
+        identity = row.get("retail_identity_key") or pricing_conflict_identity(row)
         if not identity:
             continue
         by_identity.setdefault(identity, []).append(row)
@@ -1021,7 +1101,48 @@ def row_from_dataframe_record(record: Dict[str, Any], source_sheet: str, index: 
             return default
         return record.get(col, default)
 
-    title = normalise_text(get("product_name"))
+    # Title selection is intentionally stateful-layout aware.
+    # Some supplier sheets use Column A as a category/state column named "Product:"
+    # and the actual sellable item title in a separate "Product description:" column:
+    #   Product:      Product/Barcode:   Product description:   Ex Vat   Inc Vat
+    #   Angle Iron    SEA04005006        6m 40*40*5mm           245      281.75
+    # Older logic mapped "Product:" as the product title, which prevented the
+    # category state from being detected and caused same-code items from different
+    # categories to be grouped incorrectly.
+    headers = list(record.keys())
+
+    def first_header_matching(needles: List[str]) -> Optional[Any]:
+        for col in headers:
+            hn = normalise_header(col)
+            if any(n in hn for n in needles):
+                return col
+        return None
+
+    primary_title = normalise_text(get("product_name"))
+    primary_title_col = mapped.get("product_name")
+    primary_title_col_norm = normalise_header(primary_title_col) if primary_title_col is not None else ""
+
+    description_title_col = first_header_matching([
+        "product description",
+        "item description",
+        "stock description",
+        "product desc",
+        "item desc",
+    ])
+    description_title = normalise_text(record.get(description_title_col, "")) if description_title_col is not None else ""
+
+    # Prefer the explicit description/title column when the mapped product_name
+    # column is a generic state/category column like "Product:".
+    title_from_description = False
+    if description_title and primary_title_col_norm in {"product", "category", "section", "group"}:
+        title = description_title
+        title_from_description = True
+    elif description_title and primary_title and normalise_for_compare(description_title) != normalise_for_compare(primary_title) and primary_title_col_norm == "product":
+        title = description_title
+        title_from_description = True
+    else:
+        title = primary_title
+
     # Fallback: find the longest text-ish cell if no title column was mapped.
     if not title:
         text_cells = [normalise_text(v) for v in record.values() if normalise_text(v)]
@@ -1033,7 +1154,7 @@ def row_from_dataframe_record(record: Dict[str, Any], source_sheet: str, index: 
     sku = clean_code(get("sku") or code)
     category = normalise_text(get("category")) or source_sheet or "Uncategorised"
     brand = normalise_text(get("brand"))
-    description = normalise_text(get("description"))
+    description = "" if title_from_description else normalise_text(get("description"))
     selling_price = parse_money(get("selling_price"))
     cost_price = parse_money(get("cost_price"))
     image_url = normalise_text(get("image_url"))
