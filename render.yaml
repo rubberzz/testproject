@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: yoco-retail-import-processor
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: MAX_UPLOAD_MB
+        value: 25
+      - key: ALLOWED_ORIGINS
+        value: "*"
