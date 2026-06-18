@@ -209,8 +209,71 @@ def set_title(row: Dict[str, Any], value: str) -> None:
     row["Product Name"] = value
 
 
-def true_duplicate_key(row: Dict[str, Any]) -> Tuple[str, str, float, float]:
+
+def category_code_key(row: Dict[str, Any]) -> str:
+    """Composite identity for supplier/manufacturing codes inside category blocks.
+
+    The same manufacturing code can appear in multiple category sections, for example
+    Palisade / SEA04005006 and Angle Iron / SEA04005006. Those are separate retail
+    items even though the code is identical, so all collision/dedupe logic must use
+    category + code rather than code alone.
+    """
+    category = normalise_text(
+        row.get("active_category")
+        or row.get("_active_category")
+        or row.get("block_category")
+        or row.get("category")
+        or row.get("Category")
+        or row.get("source_sheet")
+        or row.get("Source Sheet")
+    )
+    code = clean_code(best_code(row)).lower()
+    if not code:
+        return ""
+    return f"{slugify(category) or 'uncategorised'}_{code}"
+
+
+def set_category_code_identity(row: Dict[str, Any], category: str = "") -> None:
+    """Store a stable composite key used by frontend/backends/database inserts."""
+    if category:
+        row["active_category"] = category
+        row["_active_category"] = category
+    key = category_code_key(row)
+    if key:
+        row["unique_id"] = key
+        row["composite_key"] = key
+        row["category_code_key"] = key
+
+
+def raw_cell_text(raw_df: pd.DataFrame, raw_index: int, col_index: int) -> str:
+    try:
+        if raw_index in raw_df.index and raw_df.shape[1] > col_index:
+            return normalise_text(raw_df.loc[raw_index].iloc[col_index])
+    except Exception:
+        pass
+    return ""
+
+
+def looks_like_category_cell(value: str, row_title: str) -> bool:
+    """True when Column A looks like a category/state value, not the product itself."""
+    text = normalise_text(value)
+    if not text:
+        return False
+    if normalise_for_compare(text) == normalise_for_compare(row_title):
+        return False
+    if parse_money(text) > 0:
+        return False
+    # Category labels are generally short text labels, not long item descriptions.
+    if len(text) > 60:
+        return False
+    # Avoid treating a plain numeric/product code cell as a category.
+    if re.fullmatch(r"[A-Za-z]{0,4}\d+[A-Za-z0-9*\-_/]*", text):
+        return False
+    return True
+
+def true_duplicate_key(row: Dict[str, Any]) -> Tuple[str, str, str, float, float]:
     return (
+        category_code_key(row) or clean_code(best_code(row)).lower(),
         normalise_for_compare(title_value(row)),
         clean_code(best_code(row)).lower(),
         round(get_price(row), 2),
@@ -230,6 +293,8 @@ def get_export_title(row: Dict[str, Any]) -> str:
 def build_price_conflict_payload(rows: List[Dict[str, Any]], group_index: int) -> Dict[str, Any]:
     """Build the compact conflict object consumed by the frontend."""
     code = best_code(rows[0])
+    composite_key = category_code_key(rows[0])
+    active_category = normalise_text(rows[0].get("active_category") or rows[0].get("_active_category") or rows[0].get("category") or rows[0].get("Category"))
     title_counts: Dict[str, int] = {}
     for row in rows:
         title = get_export_title(row) or "Untitled product"
@@ -246,6 +311,8 @@ def build_price_conflict_payload(rows: List[Dict[str, Any]], group_index: int) -
             "title": get_export_title(row),
             "category": get_category(row),
             "code": best_code(row),
+            "unique_id": category_code_key(row),
+            "composite_key": category_code_key(row),
             "price": get_price(row),
             "cost": get_cost(row),
             "product_id": product_id_value(row),
@@ -258,10 +325,13 @@ def build_price_conflict_payload(rows: List[Dict[str, Any]], group_index: int) -
 
     return {
         "type": "price_conflict",
-        "conflict_id": hashlib.sha1((clean_code(code).lower() + "::" + str(group_index)).encode("utf-8")).hexdigest()[:16],
+        "conflict_id": hashlib.sha1(((composite_key or clean_code(code).lower()) + "::" + str(group_index)).encode("utf-8")).hexdigest()[:16],
         "title": title,
+        "category": active_category,
         "code": clean_code(code),
-        "message": f"Pricing Conflict found for {title} (Barcode: {clean_code(code)})",
+        "unique_id": composite_key,
+        "composite_key": composite_key,
+        "message": f"Pricing Conflict found for {title} (Category: {active_category or 'Uncategorised'}, Barcode: {clean_code(code)})",
         "options": options,
         "option_count": len(options),
     }
@@ -292,20 +362,20 @@ def is_price_conflict_code_eligible(code: str, rows: Optional[List[Dict[str, Any
 def split_price_conflicts(products: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Remove pricing/code collisions from the flat products list and return them as grouped conflicts.
 
-    A pricing collision is two or more rows with the exact same manufacturing/scanning code
-    but different price and/or cost metrics. These should not be shown as bulky duplicate
-    cards. The frontend receives one compact conflict object and asks the user to keep one option.
+    A pricing collision is two or more rows with the same composite identity
+    (active_category + manufacturing/scanning code) but different price and/or cost metrics.
+    The same code in different categories is deliberately kept separate.
     """
-    by_code: Dict[str, List[Dict[str, Any]]] = {}
+    by_identity: Dict[str, List[Dict[str, Any]]] = {}
     for row in products:
-        code = clean_code(best_code(row)).lower()
-        if not code:
+        identity = category_code_key(row)
+        if not identity:
             continue
-        by_code.setdefault(code, []).append(row)
+        by_identity.setdefault(identity, []).append(row)
 
     conflict_uids = set()
     conflicts: List[Dict[str, Any]] = []
-    for group_index, rows in enumerate(by_code.values()):
+    for group_index, rows in enumerate(by_identity.values()):
         if len(rows) < 2:
             continue
         code = best_code(rows[0])
@@ -376,6 +446,8 @@ def preflight_products_for_frontend(products: List[Dict[str, Any]]) -> List[Dict
             row["Barcode"] = row.get("Barcode") or code
             row["sku"] = row.get("sku") or row.get("SKU") or code
             row["SKU"] = row.get("SKU") or row.get("sku") or code
+
+        set_category_code_identity(row)
 
         if title:
             set_title(row, title)
@@ -949,6 +1021,7 @@ def apply_category_prefix(row: Dict[str, Any], current_category: str) -> Dict[st
     generic_cats = {"", "uncategorised", normalise_text(row.get("source_sheet")).lower()}
     if existing_category.lower() in generic_cats:
         row["category"] = category
+    set_category_code_identity(row, category)
     return row
 
 
@@ -1003,12 +1076,25 @@ def parse_cleaned_rows_with_category_state(cleaned: pd.DataFrame, raw_df: pd.Dat
         if not row:
             continue
 
+        # Composite-layout support: Column A may be a stateful category column.
+        # If Column A has text, it updates active_category; blank Column A retains
+        # the previous category. This covers layouts like:
+        #   Palisade | SEA04005006 | ... | R342.2
+        #            | SEA05003006 | ... | R268.8
+        #   Angle Iron | SEA04005006 | ... | R343.7
+        # The same code under different active_category values stays separate.
+        col_a = raw_cell_text(raw_df, int(raw_index), 0)
+        if looks_like_category_cell(col_a, title_value(row)):
+            current_category = col_a
+
         if is_category_heading_row(row):
             current_category = title_value(row)
             continue
 
         if row_has_price_metrics(row):
             row = apply_category_prefix(row, current_category)
+        else:
+            set_category_code_identity(row, current_category)
 
         parsed.append(row)
 
