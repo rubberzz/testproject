@@ -61,8 +61,12 @@ COLUMN_ALIASES = {
     "barcode": ["barcode", "bar code", "ean", "upc", "gtin", "scancode", "scan code"],
     "sku": ["sku", "stock code", "item code", "product code", "code", "plu", "variant sku"],
     "selling_price": [
-        "selling price", "sell price", "sale price", "retail price", "price", "price incl",
-        "price inc", "incl vat", "inc vat", "including vat", "vat incl", "rrp", "shelf price",
+        # Highest priority: final price the shop should charge.
+        "selling", "selling price", "sell price", "sale price", "retail/trade",
+        "retail trade", "retail", "retail price", "trade price", "dealer price",
+        "customer price", "shelf price", "rrp", "list price", "each price",
+        # Lower priority: price including VAT; only use when no final Selling/Retail column exists.
+        "price", "price incl", "price inc", "incl vat", "inc vat", "including vat", "vat incl",
     ],
     "cost_price": [
         "cost price", "cost", "default cost price", "ex vat", "excl vat", "nett", "net price",
@@ -263,6 +267,28 @@ def build_price_conflict_payload(rows: List[Dict[str, Any]], group_index: int) -
     }
 
 
+
+
+def is_price_conflict_code_eligible(code: str, rows: Optional[List[Dict[str, Any]]] = None) -> bool:
+    """Avoid grouping generic stock/treatment codes as barcode price conflicts.
+
+    Codes like CCA appear on 100+ different timber rows and are not a unique
+    manufacturing/scanning code. Strong candidates are real barcodes or long
+    supplier/manufacturing codes.
+    """
+    code = clean_code(code)
+    if not code:
+        return False
+    digits = re.sub(r"\D", "", code)
+    if len(digits) >= 8:
+        return True
+    if len(code) >= 8 and len(digits) >= 4:
+        return True
+    # If a code appears on a very large number of dissimilar rows, treat it as generic.
+    if rows and len(rows) > 20:
+        return False
+    return False
+
 def split_price_conflicts(products: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Remove pricing/code collisions from the flat products list and return them as grouped conflicts.
 
@@ -281,6 +307,9 @@ def split_price_conflicts(products: List[Dict[str, Any]]) -> Tuple[List[Dict[str
     conflicts: List[Dict[str, Any]] = []
     for group_index, rows in enumerate(by_code.values()):
         if len(rows) < 2:
+            continue
+        code = best_code(rows[0])
+        if not is_price_conflict_code_eligible(code, rows):
             continue
         price_cost_signatures = {
             (round(get_price(row), 2), round(get_cost(row), 2))
@@ -308,6 +337,7 @@ def preflight_products_payload(products: List[Dict[str, Any]]) -> Dict[str, Any]
     before_count = len(products)
     cleaned = preflight_products_for_frontend(products)
     flat_products, price_conflicts = split_price_conflicts(cleaned)
+    enriched_remaining_duplicate_ids = enrich_remaining_duplicate_product_ids(flat_products)
     conflict_rows = sum(len(conflict.get("options", [])) for conflict in price_conflicts)
     return {
         "products": flat_products,
@@ -318,6 +348,7 @@ def preflight_products_payload(products: List[Dict[str, Any]]) -> Dict[str, Any]
             "removed_true_duplicates": before_count - len(cleaned),
             "price_conflict_groups": len(price_conflicts),
             "price_conflict_rows": conflict_rows,
+            "enriched_remaining_duplicate_ids": enriched_remaining_duplicate_ids,
         },
     }
 
@@ -424,6 +455,59 @@ def preflight_products_for_frontend(products: List[Dict[str, Any]]) -> List[Dict
     return deduped
 
 
+
+
+def enrich_remaining_duplicate_product_ids(products: List[Dict[str, Any]]) -> int:
+    """Make remaining same-ID singles unique after true dedupe and price-conflict extraction.
+
+    This handles generic rows where the code is not a unique barcode (e.g. CCA timber treatment)
+    and the product name alone is too generic (Pole/Dropper/Lath). We append source_context,
+    price, or source row to make the Yoco Product ID unique without forcing the user through
+    100+ duplicate cards.
+    """
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for row in products:
+        if normalise_text(row.get("variant_enabled") or row.get("Variant Enabled")).lower() == "yes":
+            continue
+        pid = product_id_value(row).lower()
+        if pid:
+            groups.setdefault(pid, []).append(row)
+
+    changed = 0
+    for _pid, rows in groups.items():
+        if len(rows) <= 1:
+            continue
+        used_ids = set()
+        for index, row in enumerate(rows):
+            title = title_value(row) or "Product"
+            context = normalise_text(row.get("source_context"))
+            price = get_price(row)
+            code = best_code(row)
+            bits: List[str] = []
+            if context and normalise_for_compare(context) not in normalise_for_compare(title):
+                bits.append(context)
+            # Do not rely on very generic codes as the only discriminator.
+            if code and is_price_conflict_code_eligible(code) and normalise_for_compare(code) not in normalise_for_compare(title):
+                bits.append(code)
+            if price:
+                bits.append(f"R{price:.2f}")
+            bits.append(f"row {row.get('source_row') or index + 1}")
+            suffix = " ".join([b for b in bits if b]).strip()
+            new_title = f"{title} - {suffix}" if suffix and normalise_for_compare(suffix) not in normalise_for_compare(title) else title
+            new_title = re.sub(r"\s+", " ", new_title).strip()
+            set_title(row, new_title)
+            base_pid = slugify(new_title)
+            new_pid = base_pid
+            counter = 2
+            while new_pid in used_ids:
+                new_pid = f"{base_pid}-{counter}"
+                counter += 1
+            used_ids.add(new_pid)
+            if product_id_value(row) != new_pid:
+                set_product_id(row, new_pid)
+                changed += 1
+    return changed
+
 def find_header_row(df: pd.DataFrame, max_scan_rows: int = 15) -> int:
     """Find likely header row by scoring known column names."""
     best_idx = 0
@@ -472,6 +556,237 @@ def map_columns(columns: List[Any]) -> Dict[str, str]:
     return mapped
 
 
+
+
+def choose_best_column(columns: List[Any], preferred_terms: List[str], banned_terms: Optional[List[str]] = None) -> Optional[str]:
+    """Choose a column using explicit priority terms.
+
+    map_columns() is broad and fuzzy. For prices we need stricter priority so
+    a sheet with both "Inc Vat" and "Selling" uses Selling, not Inc Vat.
+    """
+    banned_terms = banned_terms or []
+    scored: List[Tuple[int, str]] = []
+    for col in columns:
+        label = normalise_header(col)
+        if not label:
+            continue
+        if any(term in label for term in banned_terms):
+            continue
+        for priority, term in enumerate(preferred_terms):
+            term_norm = normalise_header(term)
+            if label == term_norm:
+                scored.append((priority * 10, col))
+                break
+            if term_norm and term_norm in label:
+                scored.append((priority * 10 + 5, col))
+                break
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0])
+    return scored[0][1]
+
+
+def choose_selling_price_column(columns: List[Any], mapped: Dict[str, str]) -> Optional[str]:
+    # Put actual retail/selling columns before Inc VAT. This fixes sheets like
+    # Voltex/Positec and also Vermont's "Retail/Trade" column.
+    preferred = [
+        "selling", "selling price", "retail/trade", "retail trade", "retail",
+        "retail price", "trade price", "dealer price", "customer price",
+        "shelf price", "rrp", "list price", "each price", "price",
+        "price incl", "price inc", "incl vat", "inc vat", "vat incl", "including vat",
+    ]
+    chosen = choose_best_column(columns, preferred, banned_terms=["cost", "ex vat", "excl vat", "nett", "net price", "wholesale"])
+    return chosen or mapped.get("selling_price")
+
+
+def choose_cost_price_column(columns: List[Any], mapped: Dict[str, str]) -> Optional[str]:
+    preferred = ["cost price", "default cost price", "cost", "ex vat", "excl vat", "nett", "net price", "wholesale", "buying price", "purchase price", "supplier price"]
+    return choose_best_column(columns, preferred, banned_terms=["selling", "retail", "inc vat", "incl vat"]) or mapped.get("cost_price")
+
+
+def source_context_from_record(record: Dict[str, Any], mapped: Dict[str, str], title: str, code: str, selling_price: float, cost_price: float) -> str:
+    """Capture extra row details that help disambiguate generic names.
+
+    Example: the Diggersrest timber table has rows like Pole / CCA / 3m / 50-75 / 79.90.
+    Earlier we only kept "Pole" as the name and "CCA" as the code, creating 100+ duplicates.
+    This preserves the distinguishing values (3m, 50-75) so the preflight can enrich names.
+    """
+    excluded_cols = {c for c in mapped.values() if c}
+    parts: List[str] = []
+    seen = set()
+    for col, value in record.items():
+        text = normalise_text(value)
+        if not text:
+            continue
+        if text == title or text == code:
+            continue
+        # Drop values that are exactly the selected selling/cost price.
+        money = parse_money(text)
+        if money and (abs(money - selling_price) < 0.005 or abs(money - cost_price) < 0.005):
+            continue
+        # Keep short descriptor/dimension values. Avoid long descriptions already in the name.
+        if len(text) > 40:
+            continue
+        key = normalise_for_compare(text)
+        if not key or key in seen:
+            continue
+        # Pure margin/profit decimals are not helpful context.
+        if re.fullmatch(r"0?\.\d+", text):
+            continue
+        parts.append(text)
+        seen.add(key)
+        if len(parts) >= 4:
+            break
+    return " ".join(parts).strip()
+
+
+
+
+def find_type_treatment_header_row(raw_df: pd.DataFrame) -> Optional[int]:
+    """Find an inline timber table header: TYPE / TREATMENT / LENGTH / DIAMETER / UNIT PRICE."""
+    for idx in range(len(raw_df)):
+        values = {normalise_header(v) for v in raw_df.iloc[idx].tolist() if normalise_text(v)}
+        if {"type", "treatment", "length", "diameter"}.issubset(values) and any("unit price" in v or v == "price" for v in values):
+            return idx
+    return None
+
+
+def parse_type_treatment_section(raw_df: pd.DataFrame, source_sheet: str) -> List[Dict[str, Any]]:
+    """Parse timber-style inline tables without reusing the previous table's headers."""
+    header_idx = find_type_treatment_header_row(raw_df)
+    if header_idx is None:
+        return []
+    header_values = [normalise_header(v) for v in raw_df.iloc[header_idx].tolist()]
+    col_by_name = {name: idx for idx, name in enumerate(header_values) if name}
+    type_idx = col_by_name.get("type")
+    treatment_idx = col_by_name.get("treatment")
+    length_idx = col_by_name.get("length")
+    diameter_idx = col_by_name.get("diameter")
+    unit_price_idx = None
+    for idx, name in enumerate(header_values):
+        if "unit price" in name or name == "price":
+            unit_price_idx = idx
+            break
+    if type_idx is None or unit_price_idx is None:
+        return []
+
+    products: List[Dict[str, Any]] = []
+    for ridx in range(header_idx + 1, len(raw_df)):
+        row = raw_df.iloc[ridx]
+        kind = normalise_text(row.iloc[type_idx]) if type_idx < len(row) else ""
+        treatment = normalise_text(row.iloc[treatment_idx]) if treatment_idx is not None and treatment_idx < len(row) else ""
+        length = normalise_text(row.iloc[length_idx]) if length_idx is not None and length_idx < len(row) else ""
+        diameter = normalise_text(row.iloc[diameter_idx]) if diameter_idx is not None and diameter_idx < len(row) else ""
+        price = parse_money(row.iloc[unit_price_idx]) if unit_price_idx < len(row) else 0.0
+        if not kind and not price:
+            continue
+        if not kind or price <= 0:
+            continue
+        name_parts = [kind, length, diameter, treatment]
+        title = " ".join([p for p in name_parts if p]).strip()
+        product_id = slugify(title)
+        products.append({
+            "product_id": product_id,
+            "product_name": title,
+            "description": "",
+            "category": source_sheet or "Uncategorised",
+            "brand": "",
+            "sku": treatment,
+            "barcode": "",
+            "selling_price": price,
+            "calculated_price": price,
+            "cost_price": 0.0,
+            "image_url": "",
+            "variant_enabled": "No",
+            "attr1_name": "",
+            "attr1_val": "",
+            "attr2_name": "",
+            "attr2_val": "",
+            "attr3_name": "",
+            "attr3_val": "",
+            "source_sheet": source_sheet,
+            "source_row": ridx + 1,
+            "source_context": " ".join([p for p in [length, diameter, treatment] if p]),
+        })
+    return products
+
+def looks_like_headerless_pair_sheet(raw_df: pd.DataFrame) -> bool:
+    """Detect sheets made of repeated code/cost/price blocks with no header row.
+
+    The "China blomme en potte" sheet is two side-by-side lists:
+      code | cost | price | blank | code | cost | price
+    Without this parser the first product row becomes the header and prices are lost.
+    """
+    df = raw_df.dropna(how="all").dropna(axis=1, how="all")
+    if df.empty or df.shape[1] < 3:
+        return False
+    sample = df.head(8)
+    scored_rows = 0
+    for _, row in sample.iterrows():
+        values = [normalise_text(v) for v in row.tolist()]
+        row_score = 0
+        for i in range(0, len(values) - 2):
+            code = values[i]
+            p1 = parse_money(values[i + 1])
+            p2 = parse_money(values[i + 2])
+            if code and not re.fullmatch(r"[Rr]?\s*[0-9,.]+", code) and p1 > 0 and p2 > 0:
+                row_score += 1
+        if row_score:
+            scored_rows += 1
+    return scored_rows >= 3
+
+
+def parse_headerless_pair_sheet(raw_df: pd.DataFrame, source_sheet: str) -> List[Dict[str, Any]]:
+    products: List[Dict[str, Any]] = []
+    df = raw_df.dropna(how="all").dropna(axis=1, how="all")
+    for ridx, row in df.iterrows():
+        values = [normalise_text(v) for v in row.tolist()]
+        # Split on blank columns, then parse each block as code | cost | price.
+        blocks: List[List[str]] = []
+        current: List[str] = []
+        for value in values:
+            if not value:
+                if current:
+                    blocks.append(current)
+                    current = []
+            else:
+                current.append(value)
+        if current:
+            blocks.append(current)
+
+        for block in blocks:
+            if len(block) < 3:
+                continue
+            code = clean_code(block[0])
+            cost = parse_money(block[1])
+            selling = parse_money(block[2])
+            if not code or selling <= 0:
+                continue
+            products.append({
+                "product_id": slugify(code),
+                "product_name": code,
+                "description": "",
+                "category": source_sheet or "Uncategorised",
+                "brand": "",
+                "sku": code,
+                "barcode": code,
+                "selling_price": selling,
+                "calculated_price": selling,
+                "cost_price": cost,
+                "image_url": "",
+                "variant_enabled": "No",
+                "attr1_name": "",
+                "attr1_val": "",
+                "attr2_name": "",
+                "attr2_val": "",
+                "attr3_name": "",
+                "attr3_val": "",
+                "source_sheet": source_sheet,
+                "source_row": int(ridx) + 1,
+                "source_context": "headerless code/cost/price block",
+            })
+    return products
+
 def dataframe_from_sheet(raw_df: pd.DataFrame) -> pd.DataFrame:
     raw_df = raw_df.dropna(how="all").dropna(axis=1, how="all")
     if raw_df.empty:
@@ -487,6 +802,15 @@ def dataframe_from_sheet(raw_df: pd.DataFrame) -> pd.DataFrame:
 
 def row_from_dataframe_record(record: Dict[str, Any], source_sheet: str, index: int) -> Optional[Dict[str, Any]]:
     mapped = map_columns(list(record.keys()))
+
+    # Use price-specific selectors instead of generic fuzzy matching. This avoids
+    # selecting Inc Vat when a final Selling/Retail column exists.
+    selling_col = choose_selling_price_column(list(record.keys()), mapped)
+    cost_col = choose_cost_price_column(list(record.keys()), mapped)
+    if selling_col:
+        mapped["selling_price"] = selling_col
+    if cost_col:
+        mapped["cost_price"] = cost_col
 
     def get(canonical: str, default: Any = "") -> Any:
         col = mapped.get(canonical)
@@ -515,6 +839,7 @@ def row_from_dataframe_record(record: Dict[str, Any], source_sheet: str, index: 
         return None
 
     product_id = normalise_text(get("product_id")) or slugify(title or code or f"product-{index + 1}")
+    source_context = source_context_from_record(record, mapped, title, code, selling_price, cost_price)
 
     row = {
         "product_id": product_id,
@@ -537,6 +862,7 @@ def row_from_dataframe_record(record: Dict[str, Any], source_sheet: str, index: 
         "attr3_val": normalise_text(get("value_3")),
         "source_sheet": source_sheet,
         "source_row": index + 1,
+        "source_context": source_context,
     }
     return row
 
@@ -561,13 +887,33 @@ def parse_uploaded_file(file_storage) -> List[Dict[str, Any]]:
         engine = "openpyxl" if ext == "xlsx" else None
         sheets = pd.read_excel(file_storage, sheet_name=None, dtype=object, header=None, engine=engine)
         for sheet_name, raw_df in sheets.items():
-            cleaned = dataframe_from_sheet(raw_df)
+            source_sheet = str(sheet_name)
+
+            inline_header_idx = find_type_treatment_header_row(raw_df)
+            inline_products: List[Dict[str, Any]] = []
+            normal_df = raw_df
+            if inline_header_idx is not None:
+                inline_products = parse_type_treatment_section(raw_df, source_sheet)
+                normal_df = raw_df.iloc[:inline_header_idx].copy()
+
+            cleaned = dataframe_from_sheet(normal_df)
             if cleaned.empty:
+                products.extend(inline_products)
                 continue
+
+            mapped = map_columns(list(cleaned.columns))
+            # Only use the headerless side-by-side parser when no real headers were detected.
+            # This prevents proper sheets like VERMONT or Diggersrest from being mistaken for
+            # code/cost/price blocks.
+            if not mapped and looks_like_headerless_pair_sheet(raw_df):
+                products.extend(parse_headerless_pair_sheet(raw_df, source_sheet))
+                continue
+
             for idx, record in enumerate(cleaned.to_dict(orient="records")):
-                row = row_from_dataframe_record(record, str(sheet_name), idx)
+                row = row_from_dataframe_record(record, source_sheet, idx)
                 if row:
                     products.append(row)
+            products.extend(inline_products)
         return products
 
     raise ValueError(f"Unsupported file type: .{ext}")
@@ -684,18 +1030,19 @@ def process_retail_file_json():
     uploaded_file = request.files["file"]
     try:
         raw_products = parse_uploaded_file(uploaded_file)
-        products = preflight_products_for_frontend(raw_products)
+        payload = preflight_products_payload(raw_products)
+        products = payload["products"]
         issues = build_issues(products)
+        summary = dict(payload.get("metadata") or {})
+        summary.update({
+            "errors": sum(1 for i in issues if i["level"] == "error"),
+            "warnings": sum(1 for i in issues if i["level"] == "warning"),
+        })
         return jsonify({
             "products": products,
+            "price_conflicts": payload.get("price_conflicts", []),
             "issues": issues,
-            "summary": {
-                "raw_rows": len(raw_products),
-                "products": len(products),
-                "removed_true_duplicates": len(raw_products) - len(products),
-                "errors": sum(1 for i in issues if i["level"] == "error"),
-                "warnings": sum(1 for i in issues if i["level"] == "warning"),
-            },
+            "summary": summary,
         })
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
@@ -715,6 +1062,7 @@ def process_retail_file_xlsx():
     try:
         raw_products = parse_uploaded_file(uploaded_file)
         products = preflight_products_for_frontend(raw_products)
+        enrich_remaining_duplicate_product_ids(products)
         output = products_to_workbook(products)
         return send_file(
             output,
