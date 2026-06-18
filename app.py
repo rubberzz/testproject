@@ -12,7 +12,33 @@ from flask_cors import CORS
 
 
 app = Flask(__name__)
-CORS(app)
+
+# Explicit CORS for browser/blob origins used by the dashboard preview.
+# This prevents opaque "TypeError: Failed to fetch" failures when the
+# dashboard is opened from a blob/usercontent origin or local file preview.
+CORS(
+    app,
+    resources={r"/*": {"origins": "*"}},
+    supports_credentials=False,
+    expose_headers=["Content-Disposition", "Content-Type"],
+    allow_headers=["Content-Type", "Authorization"],
+    methods=["GET", "POST", "OPTIONS"],
+)
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers.setdefault("Access-Control-Allow-Origin", "*")
+    response.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    response.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
+    response.headers.setdefault("Access-Control-Expose-Headers", "Content-Disposition, Content-Type")
+    return response
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(exc):
+    # Always return JSON + CORS instead of letting the connection die silently.
+    app.logger.exception("Unhandled backend error")
+    return jsonify({"error": str(exc), "type": exc.__class__.__name__}), 500
+
 
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "50"))
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
@@ -1243,11 +1269,19 @@ def health_check():
         "status": "ok",
         "service": "Yoco retail file processor",
         "endpoints": [
+            "GET /",
+            "GET /health",
             "POST /process-retail-file-json",
             "POST /process-retail-file",
             "POST /export-yoco-file",
+            "POST /resolve-price-conflict",
         ],
     })
+
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", "service": "Yoco retail file processor"})
 
 
 @app.post("/process-retail-file-json")
