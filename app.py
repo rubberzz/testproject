@@ -17,6 +17,10 @@ CORS(app)
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "50"))
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 
+# Lightweight in-memory store for conflict choices from the frontend.
+# For production you can replace this with Firestore/Postgres/S3/etc.
+PRICE_CONFLICT_DECISIONS: Dict[str, Dict[str, Any]] = {}
+
 YOCO_PRODUCTS_COLUMNS = [
     "Product ID",
     "Product Name",
@@ -209,6 +213,113 @@ def true_duplicate_key(row: Dict[str, Any]) -> Tuple[str, str, float, float]:
         round(get_cost(row), 2),
     )
 
+
+
+def get_category(row: Dict[str, Any]) -> str:
+    return normalise_text(row.get("category") or row.get("Category"))
+
+
+def get_export_title(row: Dict[str, Any]) -> str:
+    return title_value(row)
+
+
+def build_price_conflict_payload(rows: List[Dict[str, Any]], group_index: int) -> Dict[str, Any]:
+    """Build the compact conflict object consumed by the frontend."""
+    code = best_code(rows[0])
+    title_counts: Dict[str, int] = {}
+    for row in rows:
+        title = get_export_title(row) or "Untitled product"
+        title_counts[title] = title_counts.get(title, 0) + 1
+    title = sorted(title_counts.items(), key=lambda item: item[1], reverse=True)[0][0]
+
+    options = []
+    for row in rows:
+        uid = normalise_text(row.get("_uid")) or row_uid(row, len(options))
+        row["_uid"] = uid
+        option_row = dict(row)
+        options.append({
+            "uid": uid,
+            "title": get_export_title(row),
+            "category": get_category(row),
+            "code": best_code(row),
+            "price": get_price(row),
+            "cost": get_cost(row),
+            "product_id": product_id_value(row),
+            "barcode": clean_code(row.get("barcode") or row.get("Barcode") or best_code(row)),
+            "sku": clean_code(row.get("sku") or row.get("SKU")),
+            "source_sheet": normalise_text(row.get("source_sheet") or row.get("Source Sheet")),
+            "source_row": row.get("source_row") or row.get("Source Row") or "",
+            "row": option_row,
+        })
+
+    return {
+        "type": "price_conflict",
+        "conflict_id": hashlib.sha1((clean_code(code).lower() + "::" + str(group_index)).encode("utf-8")).hexdigest()[:16],
+        "title": title,
+        "code": clean_code(code),
+        "message": f"Pricing Conflict found for {title} (Barcode: {clean_code(code)})",
+        "options": options,
+        "option_count": len(options),
+    }
+
+
+def split_price_conflicts(products: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Remove pricing/code collisions from the flat products list and return them as grouped conflicts.
+
+    A pricing collision is two or more rows with the exact same manufacturing/scanning code
+    but different price and/or cost metrics. These should not be shown as bulky duplicate
+    cards. The frontend receives one compact conflict object and asks the user to keep one option.
+    """
+    by_code: Dict[str, List[Dict[str, Any]]] = {}
+    for row in products:
+        code = clean_code(best_code(row)).lower()
+        if not code:
+            continue
+        by_code.setdefault(code, []).append(row)
+
+    conflict_uids = set()
+    conflicts: List[Dict[str, Any]] = []
+    for group_index, rows in enumerate(by_code.values()):
+        if len(rows) < 2:
+            continue
+        price_cost_signatures = {
+            (round(get_price(row), 2), round(get_cost(row), 2))
+            for row in rows
+        }
+        price_values = {round(get_price(row), 2) for row in rows}
+        # Primary trigger is different price. Cost difference is also included because
+        # supplier files often expose the same problem as different cost metrics.
+        if len(price_values) <= 1 and len(price_cost_signatures) <= 1:
+            continue
+        conflict = build_price_conflict_payload(rows, group_index)
+        conflicts.append(conflict)
+        for option in conflict["options"]:
+            conflict_uids.add(option["uid"])
+
+    if not conflicts:
+        return products, []
+
+    remaining = [row for row in products if normalise_text(row.get("_uid")) not in conflict_uids]
+    return remaining, conflicts
+
+
+def preflight_products_payload(products: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Full frontend payload preflight: dedupe, enrich generic IDs, then group price conflicts."""
+    before_count = len(products)
+    cleaned = preflight_products_for_frontend(products)
+    flat_products, price_conflicts = split_price_conflicts(cleaned)
+    conflict_rows = sum(len(conflict.get("options", [])) for conflict in price_conflicts)
+    return {
+        "products": flat_products,
+        "price_conflicts": price_conflicts,
+        "metadata": {
+            "raw_rows": before_count,
+            "products": len(flat_products),
+            "removed_true_duplicates": before_count - len(cleaned),
+            "price_conflict_groups": len(price_conflicts),
+            "price_conflict_rows": conflict_rows,
+        },
+    }
 
 def preflight_products_for_frontend(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Clean product rows before returning them to the frontend.
@@ -642,6 +753,35 @@ def export_yoco_file():
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
+
+
+@app.post("/resolve-price-conflict")
+def resolve_price_conflict():
+    """Record the user's price-conflict choice.
+
+    The frontend removes the conflict card immediately for speed and sends this
+    asynchronously. Because /export-yoco-file receives the final edited products
+    from the browser, this endpoint is intentionally lightweight. Swap the
+    in-memory dictionary for a persistent store in production if needed.
+    """
+    payload = request.get_json(silent=True) or {}
+    conflict_id = normalise_text(payload.get("conflict_id"))
+    selected_uid = normalise_text(payload.get("selected_uid"))
+    if not conflict_id or not selected_uid:
+        return jsonify({"error": "conflict_id and selected_uid are required"}), 400
+
+    rejected_uids = payload.get("rejected_uids") or []
+    if not isinstance(rejected_uids, list):
+        rejected_uids = []
+
+    PRICE_CONFLICT_DECISIONS[conflict_id] = {
+        "conflict_id": conflict_id,
+        "selected_uid": selected_uid,
+        "rejected_uids": rejected_uids,
+        "selected_price": parse_money(payload.get("selected_price")),
+        "selected_row": payload.get("selected_row") or {},
+    }
+    return jsonify({"ok": True, "saved": PRICE_CONFLICT_DECISIONS[conflict_id]})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
