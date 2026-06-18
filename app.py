@@ -491,7 +491,13 @@ def looks_like_category_cell(value: str, row_title: str) -> bool:
     text = normalise_text(value)
     if not text:
         return False
-    if normalise_for_compare(text) == normalise_for_compare(row_title):
+    text_norm = normalise_for_compare(text)
+    title_norm = normalise_for_compare(row_title)
+    if text_norm == title_norm:
+        return False
+    # If Column A is just the first part of a split product name (e.g.
+    # "Denova" + "tissue" -> "Denova tissue"), do not treat it as a category.
+    if title_norm.startswith(text_norm + " "):
         return False
     if parse_money(text) > 0:
         return False
@@ -912,6 +918,252 @@ def choose_cost_price_column(columns: List[Any], mapped: Dict[str, str]) -> Opti
     return choose_best_column(columns, preferred, banned_terms=["selling", "retail", "inc vat", "incl vat"]) or mapped.get("cost_price")
 
 
+
+
+def is_shopify_export_sheet(raw_df: pd.DataFrame) -> bool:
+    """Detect Shopify product export style sheets.
+
+    Shopify exports are wide, already one-row-per-variant tables with columns
+    like Handle, Title, Option1 Name, Option1 Value, Variant SKU and Variant Price.
+    They need a dedicated parser because product-level fields are only populated
+    on the first row of each handle and should be forward-filled within the handle.
+    """
+    if raw_df.empty:
+        return False
+    for ridx in range(min(len(raw_df), 8)):
+        headers = [normalise_header(v) for v in raw_df.iloc[ridx].tolist()]
+        header_set = set(h for h in headers if h)
+        required = {"handle", "title", "variant price"}
+        optionish = any(h.startswith("option1") for h in header_set)
+        skuish = "variant sku" in header_set or "variant barcode" in header_set
+        if required.issubset(header_set) and optionish and skuish:
+            return True
+    return False
+
+
+def find_shopify_header_row(raw_df: pd.DataFrame) -> Optional[int]:
+    for ridx in range(min(len(raw_df), 12)):
+        headers = [normalise_header(v) for v in raw_df.iloc[ridx].tolist()]
+        header_set = set(h for h in headers if h)
+        if {"handle", "title", "variant price"}.issubset(header_set):
+            return ridx
+    return None
+
+
+def shopify_category_to_yoco(value: Any) -> str:
+    text = normalise_text(value)
+    if not text:
+        return "Uncategorised"
+    # Shopify taxonomy strings look like Apparel & Accessories > Clothing > Shirts.
+    # Use the broadest useful category for Yoco, not the full long path.
+    parts = [p.strip() for p in text.split(">") if p.strip()]
+    if not parts:
+        return text
+    # Keep Clothing/Apparel readable if present.
+    for part in parts:
+        pn = normalise_for_compare(part)
+        if "clothing" in pn or "apparel" in pn:
+            return "Clothing & Apparel"
+    return parts[-1] if len(parts[-1]) <= 40 else parts[0]
+
+
+def clean_html_text(value: Any) -> str:
+    text = normalise_text(value)
+    if not text:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = text.replace("&amp;", "&").replace("&nbsp;", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def parse_shopify_export_sheet(raw_df: pd.DataFrame, source_sheet: str) -> List[Dict[str, Any]]:
+    """Parse Shopify product exports without hardcoding one store format.
+
+    Supports the common Shopify columns: Handle, Title, Product Category,
+    Option1/2/3 Name + Value, Variant SKU, Variant Barcode, Variant Price,
+    Cost per item, Image Src, and Status. Product-level cells are forward-filled
+    per handle, but option/variant cells stay row-specific.
+    """
+    header_idx = find_shopify_header_row(raw_df)
+    if header_idx is None:
+        return []
+
+    headers = [normalise_text(v) or f"Column {i+1}" for i, v in enumerate(raw_df.iloc[header_idx].tolist())]
+    data = raw_df.iloc[header_idx + 1:].copy()
+    data.columns = headers
+
+    # Build a case-insensitive lookup from normalised header to original header.
+    hmap = {normalise_header(h): h for h in headers if normalise_header(h)}
+
+    def col(*names: str) -> Optional[str]:
+        for name in names:
+            n = normalise_header(name)
+            if n in hmap:
+                return hmap[n]
+        for hnorm, original in hmap.items():
+            for name in names:
+                n = normalise_header(name)
+                if n and n in hnorm:
+                    return original
+        return None
+
+    c_handle = col("Handle")
+    c_title = col("Title")
+    c_body = col("Body (HTML)", "Body HTML", "Description")
+    c_category = col("Product Category", "Category", "Type")
+    c_vendor = col("Vendor", "Brand")
+    c_sku = col("Variant SKU", "SKU")
+    c_barcode = col("Variant Barcode", "Barcode")
+    c_price = col("Variant Price", "Price / South Africa", "Price")
+    c_cost = col("Cost per item", "Cost", "Default Cost Price")
+    c_image = col("Variant Image", "Image Src", "Image URL")
+    c_status = col("Status")
+
+    option_cols = []
+    for idx in range(1, 4):
+        option_cols.append((
+            col(f"Option{idx} Name", f"Option {idx} Name"),
+            col(f"Option{idx} Value", f"Option {idx} Value"),
+        ))
+
+    products: List[Dict[str, Any]] = []
+    current: Dict[str, str] = {"handle": "", "title": "", "category": "", "brand": "", "description": "", "image_url": ""}
+    current_option_names = ["", "", ""]
+
+    for offset, (_, series) in enumerate(data.iterrows(), start=header_idx + 2):
+        record = series.to_dict()
+        handle = normalise_text(record.get(c_handle)) if c_handle else ""
+        title = normalise_text(record.get(c_title)) if c_title else ""
+        if handle and handle != current.get("handle"):
+            current_option_names = ["", "", ""]
+            current["handle"] = handle
+        elif handle:
+            current["handle"] = handle
+        if title:
+            current["title"] = title
+        if c_category and normalise_text(record.get(c_category)):
+            current["category"] = shopify_category_to_yoco(record.get(c_category))
+        if c_vendor and normalise_text(record.get(c_vendor)):
+            current["brand"] = normalise_text(record.get(c_vendor))
+        if c_body and normalise_text(record.get(c_body)):
+            current["description"] = clean_html_text(record.get(c_body))
+        if c_image and normalise_text(record.get(c_image)):
+            current["image_url"] = normalise_text(record.get(c_image))
+
+        if not current["handle"] and not current["title"]:
+            continue
+
+        price = parse_money(record.get(c_price)) if c_price else 0.0
+        # Shopify exports may have regional price columns; use them if Variant Price blank.
+        if price <= 0:
+            for hnorm, original in hmap.items():
+                if hnorm.startswith("price") and "compare" not in hnorm:
+                    price = parse_money(record.get(original))
+                    if price > 0:
+                        break
+        cost = parse_money(record.get(c_cost)) if c_cost else 0.0
+        sku = clean_code(record.get(c_sku)) if c_sku else ""
+        barcode = clean_code(record.get(c_barcode)) if c_barcode else ""
+        code = barcode or sku
+
+        attr_data = []
+        for opt_index, (name_col, val_col) in enumerate(option_cols):
+            name = normalise_text(record.get(name_col)) if name_col else ""
+            value = normalise_text(record.get(val_col)) if val_col else ""
+            if name and name.lower() != "title":
+                current_option_names[opt_index] = name
+            elif name.lower() == "title":
+                name = ""
+            if value and value.lower() not in {"default title", "default"}:
+                attr_data.append((current_option_names[opt_index] or name or f"Option {len(attr_data)+1}", value))
+
+        if price <= 0 and not sku and not barcode and not attr_data:
+            # Product image/detail continuation row, not a sellable variant.
+            continue
+
+        product_id = slugify(current["handle"] or current["title"])
+        product_name = current["title"] or current["handle"]
+        row = {
+            "product_id": product_id,
+            "product_name": product_name,
+            "description": current.get("description", ""),
+            "category": current.get("category") or "Uncategorised",
+            "brand": current.get("brand", ""),
+            "sku": sku or code,
+            "barcode": barcode or code,
+            "selling_price": float(price or 0),
+            "calculated_price": float(price or 0),
+            "cost_price": float(cost or 0),
+            "image_url": current.get("image_url", ""),
+            "variant_enabled": "Yes" if attr_data else "No",
+            "attr1_name": attr_data[0][0] if len(attr_data) > 0 else "",
+            "attr1_val": attr_data[0][1] if len(attr_data) > 0 else "",
+            "attr2_name": attr_data[1][0] if len(attr_data) > 1 else "",
+            "attr2_val": attr_data[1][1] if len(attr_data) > 1 else "",
+            "attr3_name": attr_data[2][0] if len(attr_data) > 2 else "",
+            "attr3_val": attr_data[2][1] if len(attr_data) > 2 else "",
+            "source_sheet": source_sheet,
+            "source_row": int(offset),
+            "source_context": "Shopify product export",
+            "shopify_handle": current.get("handle", ""),
+        }
+        set_category_code_identity(row, current.get("category", ""))
+        products.append(row)
+
+    return products
+
+
+def combine_adjacent_title_fragments(record: Dict[str, Any], mapped: Dict[str, str], title: str) -> str:
+    """Combine split product names in simple product/price sheets.
+
+    Example:
+      PRODUCTS |       | PRICE
+      Denova   | tissue| R10.00
+    becomes "Denova tissue" instead of only "Denova".
+
+    Guardrails avoid merging SKU/barcode/cost/category/price columns or values
+    that look like pure codes/prices.
+    """
+    if not title:
+        return title
+    headers = list(record.keys())
+    product_col = mapped.get("product_name")
+    price_col = mapped.get("selling_price")
+    if product_col not in headers or price_col not in headers:
+        return title
+    try:
+        pidx = headers.index(product_col)
+        price_idx = headers.index(price_col)
+    except ValueError:
+        return title
+    if pidx >= price_idx or price_idx - pidx > 5:
+        return title
+
+    excluded = {mapped.get(k) for k in ["barcode", "sku", "cost_price", "category", "brand", "product_id"] if mapped.get(k)}
+    fragments: List[str] = []
+    for col in headers[pidx:price_idx]:
+        if col in excluded:
+            continue
+        text = normalise_text(record.get(col))
+        if not text:
+            continue
+        if parse_money(text) > 0:
+            continue
+        code_candidate = clean_code(text)
+        # Treat as a code only when it contains digits or is clearly an uppercase
+        # stock-code token. Lowercase words like "tissue" are name fragments.
+        if code_candidate and re.fullmatch(r"[A-Z0-9*./-]{5,}", code_candidate) and (any(ch.isdigit() for ch in code_candidate) or text == text.upper()):
+            continue
+        # Skip repeated headers/price labels accidentally present in data.
+        if normalise_header(text) in {"price", "sell", "selling", "products", "product"}:
+            continue
+        fragments.append(text)
+    if len(fragments) <= 1:
+        return title
+    combined = " ".join(fragments)
+    return re.sub(r"\s+", " ", combined).strip() or title
+
+
 def source_context_from_record(record: Dict[str, Any], mapped: Dict[str, str], title: str, code: str, selling_price: float, cost_price: float) -> str:
     """Capture extra row details that help disambiguate generic names.
 
@@ -1175,6 +1427,9 @@ def row_from_dataframe_record(record: Dict[str, Any], source_sheet: str, index: 
         if text_cells:
             title = max(text_cells, key=len)
 
+    # Generic split-name support for simple product/price layouts.
+    title = combine_adjacent_title_fragments(record, mapped, title)
+
     code = clean_code(get("barcode") or get("sku"))
     sku = clean_code(get("sku") or code)
     category = normalise_text(get("category")) or source_sheet or "Uncategorised"
@@ -1378,6 +1633,246 @@ def parse_cleaned_rows_with_category_state(cleaned: pd.DataFrame, raw_df: pd.Dat
     return parsed
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Universal sectioned spreadsheet parser
+# ─────────────────────────────────────────────────────────────────────────────
+# Many retail price lists are not a single rectangular table. They are visually
+# arranged as repeated blocks such as:
+#   No. | QUARTS | SELL | blank | No. | CANS & LONG TOMS | SELL
+#   1   | Item A | 22   |       | 1   | Item B            | 20
+# Later in the same sheet another header row may appear:
+#   No. | WINE   | SELL | blank | No. | SPIRIT | SELL | 200ml | 300ml
+# A generic pandas header mapper only reads one block and loses the others. This
+# parser detects those repeated visual blocks without hard-coding the category
+# names. It treats the header's middle label as the category, and extracts every
+# priced item beneath each block.
+
+def is_no_header(value: Any) -> bool:
+    h = normalise_header(value)
+    return bool(h) and (h == "no" or h == "no." or h.endswith(" no") or h in {"2 no", "no 2"})
+
+
+def is_sell_header(value: Any) -> bool:
+    h = normalise_header(value)
+    return h in {"sell", "selling", "selling price", "price", "each price", "retail", "retail price", "trade", "retail trade", "retail/trade"}
+
+
+def looks_like_extra_price_header(value: Any) -> bool:
+    text = normalise_text(value)
+    h = normalise_header(value)
+    if not text or is_no_header(value) or is_sell_header(value):
+        return False
+    # Size/volume headers like 200ml, 300ml, 1L, 6 pack.
+    if re.search(r"\b\d+(?:[,.]\d+)?\s*(ml|l|litre|liter|g|kg|pack|pcs|units?)\b", text, re.I):
+        return True
+    # Short labels are often option headers. Avoid long product-like text.
+    return len(text) <= 16 and not parse_money(text)
+
+
+def find_sectioned_table_blocks(raw_df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Find repeated visual table blocks inside a sheet.
+
+    Returns blocks with header row, product column, price column, category label,
+    and optional extra price columns. This is generic: it does not know category
+    names like QUARTS/WINE/SPIRIT in advance.
+    """
+    blocks: List[Dict[str, Any]] = []
+    if raw_df.empty:
+        return blocks
+    ncols = raw_df.shape[1]
+    for ridx in range(len(raw_df)):
+        row = raw_df.iloc[ridx]
+        for c in range(0, max(0, ncols - 2)):
+            if not is_no_header(row.iloc[c]):
+                continue
+            category = normalise_text(row.iloc[c + 1]) if c + 1 < ncols else ""
+            price_header = row.iloc[c + 2] if c + 2 < ncols else ""
+            if not category or not is_sell_header(price_header):
+                continue
+            extra_cols: List[Tuple[int, str]] = []
+            j = c + 3
+            while j < ncols:
+                val = row.iloc[j]
+                if not normalise_text(val):
+                    break
+                # Stop if another block begins.
+                if is_no_header(val):
+                    break
+                if looks_like_extra_price_header(val):
+                    extra_cols.append((j, normalise_text(val)))
+                    j += 1
+                    continue
+                break
+            blocks.append({
+                "header_row": ridx,
+                "no_col": c,
+                "product_col": c + 1,
+                "price_col": c + 2,
+                "category": category,
+                "extra_price_cols": extra_cols,
+            })
+    return blocks
+
+
+def price_from_embedded_text(title: str) -> Tuple[str, float]:
+    """Extract prices embedded in labels like '6 pack ... @R130,00'."""
+    text = normalise_text(title)
+    if not text:
+        return "", 0.0
+    match = re.search(r"(?:@|\bat\b)\s*R?\s*(\d+(?:[,.]\d{1,2})?)", text, re.I)
+    if not match:
+        return text, 0.0
+    price = parse_money(match.group(1))
+    cleaned = re.sub(r"\s*(?:@|\bat\b)\s*R?\s*\d+(?:[,.]\d{1,2})?", "", text, flags=re.I).strip()
+    return cleaned or text, price
+
+
+
+def is_price_value_cell(value: Any) -> bool:
+    """True for actual price cells, false for labels like 200ml/300ml."""
+    return parse_money(value) > 0 and not looks_like_extra_price_header(value)
+
+
+def infer_extra_price_columns_from_first_data_row(raw_df: pd.DataFrame, start: int, price_col: int) -> List[Tuple[int, str]]:
+    """Some sheets put extra price headers on the first product row.
+
+    Example:
+      No | SPIRIT | SELL |     |
+      1  | Amarula 750ml | 200 | 200ml | 300ml
+      2  | Ayoba 110ml   | 15  | 30    | 40
+    Here 200ml/300ml are headers, not prices for Amarula. We infer them and
+    only use them on rows where the cell contains a true price value.
+    """
+    if start >= len(raw_df):
+        return []
+    ncols = raw_df.shape[1]
+    row = raw_df.iloc[start]
+    extras: List[Tuple[int, str]] = []
+    j = price_col + 1
+    while j < ncols:
+        label = normalise_text(row.iloc[j]) if j < len(row) else ""
+        if not label:
+            break
+        if not looks_like_extra_price_header(label):
+            break
+        has_numeric_below = False
+        for ridx in range(start + 1, min(len(raw_df), start + 8)):
+            if is_price_value_cell(raw_df.iloc[ridx].iloc[j]):
+                has_numeric_below = True
+                break
+        if has_numeric_below:
+            extras.append((j, label))
+        j += 1
+    return extras
+
+def title_with_replaced_size(title: str, new_size: str) -> str:
+    """Replace the first size token in a title with new_size, otherwise append."""
+    title = normalise_text(title)
+    new_size = normalise_text(new_size)
+    if not title or not new_size:
+        return title
+    pattern = r"\b\d+(?:[,.]\d+)?\s*(?:ml|l|litre|liter|g|kg)\b"
+    if re.search(pattern, title, flags=re.I):
+        return re.sub(pattern, new_size, title, count=1, flags=re.I).strip()
+    return f"{title} {new_size}".strip()
+
+
+def make_sectioned_product(title: str, category: str, price: float, source_sheet: str, ridx: int, code: str = "") -> Dict[str, Any]:
+    title = normalise_text(title)
+    category = normalise_text(category) or source_sheet or "Uncategorised"
+    code = clean_code(code)
+    product_id = slugify(title or code or f"row-{ridx + 1}")
+    row = {
+        "product_id": product_id,
+        "product_name": title,
+        "description": "",
+        "category": category,
+        "brand": "",
+        "sku": code,
+        "barcode": code,
+        "selling_price": float(price or 0),
+        "calculated_price": float(price or 0),
+        "cost_price": 0.0,
+        "image_url": "",
+        "variant_enabled": "No",
+        "attr1_name": "",
+        "attr1_val": "",
+        "attr2_name": "",
+        "attr2_val": "",
+        "attr3_name": "",
+        "attr3_val": "",
+        "source_sheet": source_sheet,
+        "source_row": int(ridx) + 1,
+        "source_context": f"sectioned table block: {category}",
+    }
+    set_category_code_identity(row, category)
+    return row
+
+
+def parse_sectioned_multi_table_sheet(raw_df: pd.DataFrame, source_sheet: str) -> List[Dict[str, Any]]:
+    """Parse sheets with multiple side-by-side/repeated visual tables."""
+    blocks = find_sectioned_table_blocks(raw_df)
+    if not blocks:
+        return []
+
+    products: List[Dict[str, Any]] = []
+    header_rows = sorted({int(b["header_row"]) for b in blocks})
+    nrows = len(raw_df)
+
+    for block in blocks:
+        start = int(block["header_row"]) + 1
+        later_headers = [r for r in header_rows if r > int(block["header_row"])]
+        end = later_headers[0] if later_headers else nrows
+        product_col = int(block["product_col"])
+        price_col = int(block["price_col"])
+        no_col = int(block["no_col"])
+        category = normalise_text(block["category"])
+        extra_price_cols = block.get("extra_price_cols") or []
+        if not extra_price_cols:
+            extra_price_cols = infer_extra_price_columns_from_first_data_row(raw_df, start, price_col)
+
+        for ridx in range(start, end):
+            row = raw_df.iloc[ridx]
+            title = normalise_text(row.iloc[product_col]) if product_col < len(row) else ""
+            if not title:
+                continue
+            # Skip accidental repeated headers inside the range.
+            if is_sell_header(title) or is_no_header(title):
+                continue
+
+            price = parse_money(row.iloc[price_col]) if price_col < len(row) else 0.0
+            if price <= 0:
+                title2, embedded_price = price_from_embedded_text(title)
+                if embedded_price > 0:
+                    title = title2
+                    price = embedded_price
+            if price > 0:
+                products.append(make_sectioned_product(title, category, price, source_sheet, ridx))
+
+            # Optional extra price columns become additional size-specific products.
+            # Example: SPIRIT section has SELL plus 200ml and 300ml columns.
+            for extra_col, extra_label in extra_price_cols:
+                if extra_col >= len(row):
+                    continue
+                cell_value = row.iloc[extra_col]
+                # Do not treat header labels like 200ml/300ml as prices.
+                if not is_price_value_cell(cell_value):
+                    continue
+                extra_price = parse_money(cell_value)
+                extra_title = title_with_replaced_size(title, extra_label)
+                # Avoid creating an identical duplicate if the normal title already
+                # uses the same size and price.
+                if normalise_for_compare(extra_title) == normalise_for_compare(title) and abs(extra_price - price) < 0.005:
+                    continue
+                products.append(make_sectioned_product(extra_title, category, extra_price, source_sheet, ridx))
+
+    # Only trust this parser when it found a meaningful number of products. This
+    # prevents a stray 'No / Category / Sell' note from hijacking a normal table.
+    if len(products) < 5:
+        return []
+    return products
+
 def parse_uploaded_file(file_storage) -> List[Dict[str, Any]]:
     filename = file_storage.filename or "upload"
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
@@ -1391,11 +1886,28 @@ def parse_uploaded_file(file_storage) -> List[Dict[str, Any]]:
         products.extend(parse_cleaned_rows_with_category_state(cleaned, df, "CSV"))
         return products
 
-    if ext in {"xlsx", "xls", "xl"}:
-        engine = "openpyxl" if ext == "xlsx" else None
+    if ext in {"xlsx", "xls", "xlsm", "xl"}:
+        engine = "openpyxl" if ext in {"xlsx", "xlsm"} else None
         sheets = pd.read_excel(file_storage, sheet_name=None, dtype=object, header=None, engine=engine)
         for sheet_name, raw_df in sheets.items():
             source_sheet = str(sheet_name)
+
+            # E-commerce exports such as Shopify are already structured as one
+            # row per variant and use repeated blank product-level cells. Parse
+            # them before visual-block/headerless heuristics.
+            if is_shopify_export_sheet(raw_df):
+                products.extend(parse_shopify_export_sheet(raw_df, source_sheet))
+                continue
+
+            # First try the universal visual-block parser. It handles versatile
+            # layouts with repeated side-by-side sections such as:
+            #   No. | QUARTS | SELL | blank | No. | CANS | SELL
+            # and later sections on the same sheet. If it produces enough rows,
+            # trust it and skip the rectangular-table parser.
+            sectioned_products = parse_sectioned_multi_table_sheet(raw_df, source_sheet)
+            if sectioned_products:
+                products.extend(sectioned_products)
+                continue
 
             inline_header_idx = find_type_treatment_header_row(raw_df)
             inline_products: List[Dict[str, Any]] = []
