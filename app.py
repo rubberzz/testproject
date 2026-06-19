@@ -78,6 +78,13 @@ def compact_product_for_frontend(row: Dict[str, Any]) -> Dict[str, Any]:
         "composite_key",
         "category_code_key",
         "retail_identity_key",
+        "_casePrice",
+        "_packQty",
+        "_originalCasePrice",
+        "_basePrice",
+        "_correctedPrice",
+        "_caseApproved",
+        "_caseSuggestionBasis",
     ]
     out: Dict[str, Any] = {}
     for key in keep:
@@ -657,12 +664,140 @@ def split_price_conflicts(products: List[Dict[str, Any]]) -> Tuple[List[Dict[str
     return remaining, conflicts
 
 
+
+_PACK_MULTIPLIER_RE = re.compile(
+    r"(?<!\d)(?:x|×)\s*(\d{1,3})(?:\s*(?:pack|case|pcs|pieces|units?|ct|count))?\b",
+    re.I,
+)
+_PACK_WORD_RE = re.compile(
+    r"\b(\d{1,3})\s*(?:pack|case|pcs|pieces|units?|ct|count)\b",
+    re.I,
+)
+
+
+def extract_pack_qty_from_text(text: Any) -> Optional[int]:
+    """Return a case/pack multiplier from names like '100ml x 24'.
+
+    Guardrails: only quantities >= 6 are considered case packs. This avoids
+    false positives on small multipacks and structural dimensions such as 25x300.
+    """
+    value = normalise_text(text)
+    if not value:
+        return None
+    match = _PACK_MULTIPLIER_RE.search(value)
+    if not match:
+        match = _PACK_WORD_RE.search(value)
+    if not match:
+        return None
+    try:
+        qty = int(match.group(1))
+    except Exception:
+        return None
+    if qty < 6:
+        return None
+    return qty
+
+
+def extract_pack_qty(row: Dict[str, Any]) -> Optional[int]:
+    """Detect case quantity from product name, description, or Pack attribute."""
+    for key in ["product_name", "Product Name", "title", "description", "Description"]:
+        qty = extract_pack_qty_from_text(row.get(key))
+        if qty:
+            return qty
+
+    # Also support already-structured variant attributes such as Pack Size = x 24.
+    attr_pairs = [
+        (row.get("attr1_name") or row.get("Attribute 1"), row.get("attr1_val") or row.get("Value 1")),
+        (row.get("attr2_name") or row.get("Attribute 2"), row.get("attr2_val") or row.get("Value 2")),
+        (row.get("attr3_name") or row.get("Attribute 3"), row.get("attr3_val") or row.get("Value 3")),
+    ]
+    for name, value in attr_pairs:
+        name_text = normalise_text(name).lower()
+        if any(word in name_text for word in ["pack", "case", "qty", "quantity", "count", "unit"]):
+            qty = extract_pack_qty_from_text(value)
+            if qty:
+                return qty
+    return None
+
+
+def strip_pack_multiplier(title: Any) -> str:
+    """Remove x N / N pack wording while preserving normal size text."""
+    text = normalise_text(title)
+    if not text:
+        return ""
+    text = _PACK_MULTIPLIER_RE.sub(" ", text)
+    text = _PACK_WORD_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip(" -·•,/\\")
+
+
+def case_base_key(row: Dict[str, Any]) -> str:
+    """Key used to match 'Coke 440ml x24' to 'Coke 440ml'."""
+    return normalise_for_compare(strip_pack_multiplier(title_value(row)))
+
+
+def flag_case_pack_prices(products: List[Dict[str, Any]]) -> int:
+    """Flag x N pack/case rows for user review before export.
+
+    We deliberately do NOT auto-change the price. The dashboard onboarding flow
+    lets the user choose between keeping the listed price and approving the
+    suggested case total. If a matching single-unit row exists, the suggestion is
+    single_unit_price * qty. Otherwise the conservative suggestion is
+    listed_price * qty.
+    """
+    single_by_base: Dict[str, List[Dict[str, Any]]] = {}
+    for row in products:
+        if extract_pack_qty(row):
+            continue
+        key = normalise_for_compare(title_value(row))
+        if key:
+            single_by_base.setdefault(key, []).append(row)
+
+    flagged = 0
+    for row in products:
+        qty = extract_pack_qty(row)
+        if not qty:
+            continue
+        listed = get_price(row)
+        if listed <= 0:
+            continue
+
+        base_key = case_base_key(row)
+        base_rows = [r for r in single_by_base.get(base_key, []) if get_price(r) > 0]
+        base_price = get_price(base_rows[0]) if base_rows else 0.0
+        suggested = round((base_price if base_price > 0 else listed) * qty, 2)
+        basis = "matched_single_unit" if base_price > 0 else "listed_price_times_quantity"
+
+        row["_casePrice"] = True
+        row["_packQty"] = qty
+        row["_originalCasePrice"] = round(listed, 2)
+        row["_basePrice"] = round(base_price, 2) if base_price > 0 else 0.0
+        row["_correctedPrice"] = suggested
+        row["_caseApproved"] = False
+        row["_caseSuggestionBasis"] = basis
+
+        # Case packs must remain separate products, not variants of the single unit.
+        set_variant_fields(row, False)
+        clear_variant_attributes(row)
+        set_product_id(row, slugify(title_value(row) or best_code(row) or f"case-pack-{flagged + 1}"))
+
+        existing_description = normalise_text(row.get("description") or row.get("Description"))
+        existing_description = re.sub(r"\s*\[CASE PRICE[^\]]*\]\s*", " ", existing_description, flags=re.I).strip()
+        if base_price > 0:
+            note = f"[CASE PRICE — verify: listed R{listed:.2f} for x{qty} units. Matching single-unit price R{base_price:.2f}; suggested case total R{suggested:.2f}.]"
+        else:
+            note = f"[CASE PRICE — verify: listed R{listed:.2f} for x{qty} units. Suggested case total R{suggested:.2f} if listed price is per unit.]"
+        row["description"] = f"{existing_description} {note}".strip()
+        row["Description"] = row["description"]
+        flagged += 1
+    return flagged
+
 def preflight_products_payload(products: List[Dict[str, Any]], parse_mode: Any = "variant") -> Dict[str, Any]:
     """Full frontend payload preflight: apply mode, dedupe, enrich IDs, then group conflicts."""
     mode = normalise_parse_mode(parse_mode)
     before_count = len(products)
     products = apply_parse_mode(products, mode)
     cleaned = preflight_products_for_frontend(products)
+    flagged_case_packs = flag_case_pack_prices(cleaned)
     flat_products, price_conflicts = split_price_conflicts(cleaned)
     enriched_remaining_duplicate_ids = enrich_remaining_duplicate_product_ids(flat_products)
     conflict_rows = sum(len(conflict.get("options", [])) for conflict in price_conflicts)
@@ -676,6 +811,7 @@ def preflight_products_payload(products: List[Dict[str, Any]], parse_mode: Any =
             "price_conflict_groups": len(price_conflicts),
             "price_conflict_rows": conflict_rows,
             "enriched_remaining_duplicate_ids": enriched_remaining_duplicate_ids,
+            "flagged_case_packs": flagged_case_packs,
             "parse_mode": mode,
         },
     }
@@ -1010,7 +1146,10 @@ def variant_candidates_from_title(title: str) -> List[Tuple[str, str, str, str]]
     if flavour:
         candidates.append((flavour[0], flavour[1], flavour[2], "flavour"))
 
-    size_pattern = r"(?:(?:\d+(?:[,.]\d+)?\s*(?:ml|l|litre|liter|g|kg|mm|cm|m))|(?:\d+(?:\s*[x×*]\s*\d+)+(?:\s*(?:mm|cm|m))?)|(?:x\s*\d+\s*(?:pack|pcs|units?)?))$"
+    # Case/pack multipliers like "100ml x 24" are NOT product variants.
+    # They are handled by flag_case_pack_prices() so the user can confirm
+    # whether the listed price is a unit price or the total case price.
+    size_pattern = r"(?:(?:\d+(?:[,.]\d+)?\s*(?:ml|l|litre|liter|g|kg|mm|cm|m))|(?:\d+(?:\s*[x×*]\s*\d+)+(?:\s*(?:mm|cm|m))?))$"
     size = re.search(size_pattern, title, flags=re.I)
     if size:
         value = size.group(0).strip()
@@ -2459,6 +2598,7 @@ def ai_layout_prompt(sample: Dict[str, Any]) -> str:
         "- For side-by-side tables, create one table object per visible block.\n"
         "- If Column A contains a category that applies to following rows, use category_rule column_a_state.\n"
         "- Identify selling/retail/customer price, not cost/wholesale, unless wholesale is clearly the only customer price.\n"
+        "- Product names containing x 6, x12, x 24, case, pack, pcs or units are case/pack rows. Do not mark them as normal variants; Python will flag them for user confirmation.\n"
         "- If confidence is below 0.70, return layout_type unknown and explain why.\n\n"
         "Workbook sample:\n" + json.dumps(safe_jsonable(sample), ensure_ascii=False)
     )
