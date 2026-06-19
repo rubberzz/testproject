@@ -2289,6 +2289,409 @@ def parse_sectioned_multi_table_sheet(raw_df: pd.DataFrame, source_sheet: str) -
         return []
     return products
 
+
+
+
+def make_product_row(
+    product_name: str,
+    category: str,
+    selling_price: float,
+    cost_price: float = 0.0,
+    barcode: str = "",
+    sku: str = "",
+    source_sheet: str = "",
+    source_row: int = 0,
+    description: str = "",
+    brand: str = "",
+    image_url: str = "",
+) -> Dict[str, Any]:
+    code = clean_code(barcode or sku)
+    title = clean_product_title(product_name)
+    row = {
+        "product_id": slugify(title or code or f"product-{source_row}"),
+        "product_name": title,
+        "description": normalise_text(description),
+        "category": clean_product_title(category) or source_sheet or "Uncategorised",
+        "brand": normalise_text(brand),
+        "sku": clean_code(sku or code),
+        "barcode": clean_code(barcode or code),
+        "selling_price": float(selling_price or 0),
+        "calculated_price": float(selling_price or 0),
+        "variant_price": float(selling_price or 0),
+        "cost_price": float(cost_price or 0),
+        "image_url": normalise_text(image_url),
+        "variant_enabled": "No",
+        "attr1_name": "",
+        "attr1_val": "",
+        "attr2_name": "",
+        "attr2_val": "",
+        "attr3_name": "",
+        "attr3_val": "",
+        "source_sheet": source_sheet,
+        "source_row": source_row,
+    }
+    row["_uid"] = row_uid(row, source_row or 0)
+    return row
+
+# ---------------------------------------------------------------------------
+# Gemini-assisted layout planning layer
+# ---------------------------------------------------------------------------
+# Goal: AI decides *where the data is* and Python performs the full extraction.
+# The model receives only a compact workbook sample and must return a strict
+# JSON layout plan. It never extracts all products itself.
+
+_AI_LAYOUT_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def column_letter_to_index(col: Any) -> Optional[int]:
+    if col is None:
+        return None
+    if isinstance(col, int):
+        return col
+    text = str(col).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        # Allow both zero and one-based indexes; most AI plans use letters.
+        n = int(text)
+        return max(0, n - 1)
+    text = re.sub(r"[^A-Za-z]", "", text).upper()
+    if not text:
+        return None
+    total = 0
+    for ch in text:
+        total = total * 26 + (ord(ch) - ord('A') + 1)
+    return total - 1
+
+
+def cell_to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and math.isnan(value):
+        return ""
+    text = str(value).strip()
+    if text.lower() in {"nan", "none", "nat"}:
+        return ""
+    return text
+
+
+def safe_jsonable(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+    if isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, list):
+        return [safe_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): safe_jsonable(v) for k, v in value.items()}
+    return str(value)
+
+
+def workbook_sample_from_bytes(raw_bytes: bytes, ext: str, max_rows: int = 60, max_cols: int = 18) -> Dict[str, Any]:
+    """Create a compact, model-friendly representation of the workbook.
+
+    This is intentionally small: sheet names, row/column coordinates and values
+    for the first rows only. Python still processes the full workbook later.
+    """
+    sample: Dict[str, Any] = {"file_type": ext, "sheets": []}
+    if ext == "csv":
+        df = pd.read_csv(io.BytesIO(raw_bytes), dtype=object, header=None)
+        sheets = {"CSV": df}
+    else:
+        engine = "openpyxl" if ext in {"xlsx", "xlsm"} else None
+        sheets = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=None, dtype=object, header=None, engine=engine)
+
+    for sheet_name, df in sheets.items():
+        rows = []
+        nrows = min(len(df), max_rows)
+        ncols = min(len(df.columns), max_cols)
+        for r in range(nrows):
+            cells = []
+            for c in range(ncols):
+                val = cell_to_text(df.iat[r, c])
+                if val:
+                    cells.append({"r": r + 1, "c": c + 1, "col": index_to_excel_col(c), "v": val[:120]})
+            if cells:
+                rows.append({"row": r + 1, "cells": cells})
+        sample["sheets"].append({
+            "sheet_name": str(sheet_name),
+            "rows": rows,
+            "max_sampled_row": nrows,
+            "max_sampled_col": ncols,
+        })
+    return sample
+
+
+def index_to_excel_col(idx: int) -> str:
+    idx += 1
+    letters = ""
+    while idx:
+        idx, rem = divmod(idx - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def ai_layout_prompt(sample: Dict[str, Any]) -> str:
+    return (
+        "You are a retail spreadsheet layout planner for a Yoco POS import tool. "
+        "You DO NOT extract all products. You only inspect the sampled rows and return a JSON extraction plan that Python can apply to the full workbook.\n\n"
+        "Return strict JSON only with this shape:\n"
+        "{\n"
+        '  "confidence": 0.0,\n'
+        '  "layout_type": "standard_table|side_by_side_tables|category_blocks|variant_export|headerless_price_list|unknown",\n'
+        '  "notes": "short reason",\n'
+        '  "sheets": [\n'
+        '    {"sheet_name":"...", "layout_type":"...", "header_row":1, "start_row":2,\n'
+        '     "category_rule":"none|column_a_state|header_blocks",\n'
+        '     "columns":{"product_name":"B", "description":"C", "sku":"A", "barcode":"D", "selling_price":"E", "cost_price":"F", "category":"A", "brand":"", "image_url":""},\n'
+        '     "tables":[{"category":"QUARTS", "header_row":2, "start_row":3, "columns":{"product_name":"B", "selling_price":"C", "sku":"A"}}],\n'
+        '     "variant":{"enabled":false, "product_id":"Handle", "attribute_1":"Option1 Name", "value_1":"Option1 Value", "attribute_2":"Option2 Name", "value_2":"Option2 Value", "price":"Variant Price", "sku":"Variant SKU"}\n'
+        "    }\n"
+        "  ],\n"
+        '  "warnings": []\n'
+        "}\n\n"
+        "Rules:\n"
+        "- Use Excel column letters for columns whenever possible.\n"
+        "- For side-by-side tables, create one table object per visible block.\n"
+        "- If Column A contains a category that applies to following rows, use category_rule column_a_state.\n"
+        "- Identify selling/retail/customer price, not cost/wholesale, unless wholesale is clearly the only customer price.\n"
+        "- If confidence is below 0.70, return layout_type unknown and explain why.\n\n"
+        "Workbook sample:\n" + json.dumps(safe_jsonable(sample), ensure_ascii=False)
+    )
+
+
+def call_gemini_layout_planner(sample: Dict[str, Any], api_key_override: str = "") -> Optional[Dict[str, Any]]:
+    """Call Gemini if GEMINI_API_KEY is configured. Otherwise return None.
+
+    The AI only returns a workbook layout plan. It does not extract products.
+    Uses urllib so the requirements file does not need a Google SDK package.
+    Key source priority:
+      1. request-provided Gemini Canvas key via api_key_override
+      2. GEMINI_API_KEY / GOOGLE_API_KEY / GOOGLE_GENERATIVE_AI_API_KEY / API_KEY env var
+      3. no AI plan; Python fallback
+    Environment variables:
+      - GEMINI_LAYOUT_MODEL, defaults to gemini-2.5-flash-preview-09-2025
+    """
+    api_key = (
+        str(api_key_override or "").strip()
+        or os.environ.get("GEMINI_API_KEY", "").strip()
+        or os.environ.get("GOOGLE_API_KEY", "").strip()
+        or os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY", "").strip()
+        or os.environ.get("API_KEY", "").strip()
+    )
+    if not api_key:
+        return None
+
+    model = os.environ.get("GEMINI_LAYOUT_MODEL", "gemini-2.5-flash-preview-09-2025").strip() or "gemini-2.5-flash-preview-09-2025"
+    cache_key = hashlib.sha256(json.dumps(safe_jsonable(sample), sort_keys=True).encode("utf-8")).hexdigest()
+    if cache_key in _AI_LAYOUT_CACHE:
+        return _AI_LAYOUT_CACHE[cache_key]
+
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+
+    prompt = (
+        "Return only strict JSON. No markdown, no prose.\n\n"
+        + ai_layout_prompt(sample)
+    )
+
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    # Gemini API endpoint. The API key is URL encoded to avoid issues with special characters.
+    encoded_key = urllib.parse.quote(api_key, safe="")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={encoded_key}"
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        app.logger.warning("Gemini layout planner unavailable: %s", exc)
+        return None
+
+    text = ""
+    try:
+        candidates = body.get("candidates", []) if isinstance(body, dict) else []
+        if candidates:
+            parts = candidates[0].get("content", {}).get("parts", [])
+            text = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+    except Exception:
+        text = ""
+
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?", "", text).strip()
+        text = re.sub(r"```$", "", text).strip()
+
+    try:
+        plan = json.loads(text)
+        if isinstance(plan, dict):
+            _AI_LAYOUT_CACHE[cache_key] = plan
+            return plan
+    except Exception as exc:
+        app.logger.warning("Gemini layout planner returned invalid JSON: %s", exc)
+    return None
+
+
+# Backwards-compatible alias so older code paths keep working.
+def call_openai_layout_planner(sample: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    return call_gemini_layout_planner(sample)
+
+
+def get_cell_by_plan(row: List[Any], col: Any) -> str:
+    idx = column_letter_to_index(col)
+    if idx is None or idx < 0 or idx >= len(row):
+        return ""
+    return cell_to_text(row[idx])
+
+
+def extract_products_with_ai_plan(raw_bytes: bytes, ext: str, plan: Dict[str, Any], parse_mode: str = "variant") -> List[Dict[str, Any]]:
+    """Apply an AI layout plan to the full workbook using deterministic Python.
+
+    This intentionally supports broad layout families. If the plan is missing
+    required fields or yields too few rows, the caller falls back to the legacy
+    Python parsers.
+    """
+    if not plan or float(plan.get("confidence") or 0) < 0.70:
+        return []
+    if ext == "csv":
+        sheets = {"CSV": pd.read_csv(io.BytesIO(raw_bytes), dtype=object, header=None)}
+    else:
+        engine = "openpyxl" if ext in {"xlsx", "xlsm"} else None
+        sheets = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=None, dtype=object, header=None, engine=engine)
+
+    sheet_plans = {str(sp.get("sheet_name", "")): sp for sp in plan.get("sheets", []) if isinstance(sp, dict)}
+    products: List[Dict[str, Any]] = []
+
+    for sheet_name, df in sheets.items():
+        sp = sheet_plans.get(str(sheet_name))
+        if not sp:
+            # If there is only one sheet, allow a single unnamed plan to apply.
+            if len(sheet_plans) == 1:
+                sp = next(iter(sheet_plans.values()))
+            else:
+                continue
+        layout_type = sp.get("layout_type") or plan.get("layout_type") or "standard_table"
+        tables = sp.get("tables") or []
+        if layout_type == "side_by_side_tables" and tables:
+            for table in tables:
+                cols = table.get("columns") or {}
+                start_row = int(table.get("start_row") or (int(table.get("header_row") or 1) + 1))
+                category = cell_to_text(table.get("category") or "")
+                for ridx in range(max(0, start_row - 1), len(df)):
+                    row = list(df.iloc[ridx].values)
+                    name = get_cell_by_plan(row, cols.get("product_name") or cols.get("name") or cols.get("description"))
+                    price = parse_money(get_cell_by_plan(row, cols.get("selling_price") or cols.get("price") or cols.get("sell")))
+                    if not name or price is None:
+                        continue
+                    code = get_cell_by_plan(row, cols.get("barcode") or cols.get("sku") or cols.get("code"))
+                    cost = parse_money(get_cell_by_plan(row, cols.get("cost_price") or cols.get("cost"))) or 0
+                    title = clean_product_title(name)
+                    products.append(make_product_row(
+                        product_name=title,
+                        category=category or str(sheet_name),
+                        selling_price=price,
+                        cost_price=cost,
+                        barcode=code,
+                        sku=code,
+                        source_sheet=str(sheet_name),
+                        source_row=ridx + 1,
+                    ))
+            continue
+
+        if layout_type in {"standard_table", "category_blocks", "headerless_price_list", "variant_export"}:
+            cols = sp.get("columns") or {}
+            header_row = int(sp.get("header_row") or 1)
+            start_row = int(sp.get("start_row") or (header_row + 1))
+            category_rule = sp.get("category_rule") or "none"
+            active_category = ""
+            for ridx in range(max(0, start_row - 1), len(df)):
+                row = list(df.iloc[ridx].values)
+                cat_cell = get_cell_by_plan(row, cols.get("category"))
+                name = get_cell_by_plan(row, cols.get("product_name") or cols.get("description") or cols.get("name"))
+                price = parse_money(get_cell_by_plan(row, cols.get("selling_price") or cols.get("price") or cols.get("sell")))
+                cost = parse_money(get_cell_by_plan(row, cols.get("cost_price") or cols.get("cost"))) or 0
+                code = get_cell_by_plan(row, cols.get("barcode") or cols.get("sku") or cols.get("code"))
+
+                if category_rule == "column_a_state" and cat_cell:
+                    active_category = clean_product_title(cat_cell)
+                if name and price is None and not code and not cost and category_rule in {"column_a_state", "header_blocks"}:
+                    active_category = clean_product_title(name)
+                    continue
+                if not name or price is None:
+                    continue
+                category = cat_cell if category_rule == "none" else (active_category or cat_cell)
+                title = clean_product_title(name)
+                if category and category_rule in {"column_a_state", "header_blocks"}:
+                    # Prefix only when the title does not already contain the category.
+                    if category.lower() not in title.lower():
+                        title = f"{category} - {title}"
+                products.append(make_product_row(
+                    product_name=title,
+                    category=category or str(sheet_name),
+                    selling_price=price,
+                    cost_price=cost,
+                    barcode=code,
+                    sku=code,
+                    source_sheet=str(sheet_name),
+                    source_row=ridx + 1,
+                ))
+    return products
+
+
+def parse_uploaded_file_ai_assisted(file_storage, parse_mode: str = "variant", gemini_api_key: str = "") -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """New architecture entrypoint.
+
+    1. Python samples workbook structure.
+    2. Optional Gemini AI returns a layout plan.
+    3. Python executes the plan at full scale.
+    4. If AI is unavailable/low-confidence, fallback to existing parsers.
+    """
+    filename = file_storage.filename or "upload"
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    raw_bytes = file_storage.read()
+    sample = workbook_sample_from_bytes(raw_bytes, ext)
+    plan = call_gemini_layout_planner(sample, api_key_override=gemini_api_key)
+    ai_products: List[Dict[str, Any]] = []
+    if plan:
+        ai_products = extract_products_with_ai_plan(raw_bytes, ext, plan, parse_mode=parse_mode)
+    if ai_products:
+        return ai_products, {"layout_strategy": "ai_plan", "layout_plan": plan, "ai_rows": len(ai_products)}
+
+    # Fallback: feed a fresh in-memory file to the existing Python parser.
+    from werkzeug.datastructures import FileStorage
+    fallback_file = FileStorage(stream=io.BytesIO(raw_bytes), filename=filename)
+    fallback_products = parse_uploaded_file(fallback_file)
+    return fallback_products, {
+        "layout_strategy": "python_fallback",
+        "layout_plan": plan,
+        "ai_rows": 0,
+        "fallback_rows": len(fallback_products),
+        "ai_available": bool((os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip() or os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY", "").strip() or os.environ.get("API_KEY", "").strip())),
+    }
+
 def parse_uploaded_file(file_storage) -> List[Dict[str, Any]]:
     filename = file_storage.filename or "upload"
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
@@ -2506,11 +2909,17 @@ def process_retail_file_json():
     uploaded_file = request.files["file"]
     try:
         parse_mode = request.form.get("parse_mode", "variant")
-        raw_products = parse_uploaded_file(uploaded_file)
+        gemini_api_key = (
+            request.form.get("gemini_api_key", "")
+            or request.form.get("apiKey", "")
+            or request.form.get("api_key", "")
+        )
+        raw_products, layout_meta = parse_uploaded_file_ai_assisted(uploaded_file, parse_mode=parse_mode, gemini_api_key=gemini_api_key)
         payload = preflight_products_payload(raw_products, parse_mode=parse_mode)
         products = payload["products"]
         issues = build_issues(products)
         summary = dict(payload.get("metadata") or {})
+        summary.update(layout_meta or {})
         summary.update({
             "errors": sum(1 for i in issues if i["level"] == "error"),
             "warnings": sum(1 for i in issues if i["level"] == "warning"),
@@ -2550,7 +2959,12 @@ def process_retail_file_xlsx():
     uploaded_file = request.files["file"]
     try:
         parse_mode = request.form.get("parse_mode", "variant")
-        raw_products = parse_uploaded_file(uploaded_file)
+        gemini_api_key = (
+            request.form.get("gemini_api_key", "")
+            or request.form.get("apiKey", "")
+            or request.form.get("api_key", "")
+        )
+        raw_products, layout_meta = parse_uploaded_file_ai_assisted(uploaded_file, parse_mode=parse_mode, gemini_api_key=gemini_api_key)
         raw_products = apply_parse_mode(raw_products, parse_mode)
         products = preflight_products_for_frontend(raw_products)
         enrich_remaining_duplicate_product_ids(products)
