@@ -12,6 +12,7 @@ from flask_cors import CORS
 
 
 app = Flask(__name__)
+APP_VERSION = "2026-06-19-drive-ai-v2"
 
 # Explicit CORS for browser/blob origins used by the dashboard preview.
 # This prevents opaque "TypeError: Failed to fetch" failures when the
@@ -3563,6 +3564,198 @@ def _apply_instructions_via_gemini(
     }
 
 
+
+def _instruction_parse_price_value(value: Any) -> Optional[float]:
+    """Parse an explicit price from instruction text, preserving zero."""
+    text = normalise_text(value)
+    if not text:
+        return None
+    m = re.search(r"(?:r\s*)?(-?\d+(?:[\.,]\d{1,2})?)", text, flags=re.I)
+    if not m:
+        return None
+    try:
+        return round(float(m.group(1).replace(",", ".")), 2)
+    except Exception:
+        return None
+
+
+def _instruction_clean_target_value(value: str) -> str:
+    value = normalise_text(value)
+    value = re.sub(r"^[\"'“”]+|[\"'“”]+$", "", value).strip()
+    value = re.sub(r"\s+(?:please|thanks|thank you)$", "", value, flags=re.I).strip()
+    return value
+
+
+def _compile_deterministic_instruction_rules(user_instructions: str) -> List[Dict[str, Any]]:
+    """Compile common natural-language instructions into deterministic rules.
+
+    This is deliberately not a full LLM. It catches high-impact instructions that
+    must work every time, including setting all prices to R0. Unknown instructions
+    can still fall through to Gemini when an API key is configured.
+    """
+    raw = normalise_text(user_instructions)
+    if not raw:
+        return []
+    text = re.sub(r"[\r\n]+", ". ", raw)
+    norm = normalise_for_compare(raw)
+    rules: List[Dict[str, Any]] = []
+
+    # All prices should be R0 / make all prices R0 / set every price to 9.99.
+    price_patterns = [
+        r"(?:make|set|change|update)\s+(?:all|every)\s+(?:prices?|selling prices?|retail prices?|default prices?)\s+(?:to|as)?\s*(r?\s*-?\d+(?:[\.,]\d{1,2})?)",
+        r"(?:all|every)\s+(?:prices?|selling prices?|retail prices?|default prices?)\s+(?:should|must|need to|needs to)?\s*(?:be|=|to)?\s*(r?\s*-?\d+(?:[\.,]\d{1,2})?)",
+        r"(?:prices?|selling prices?|retail prices?)\s+(?:should|must|need to|needs to)?\s*(?:be|=|to)\s*(r?\s*-?\d+(?:[\.,]\d{1,2})?)",
+    ]
+    for pat in price_patterns:
+        m = re.search(pat, text, flags=re.I)
+        if m:
+            val = _instruction_parse_price_value(m.group(1))
+            if val is not None:
+                rules.append({"action": "set_price", "value": val, "scope": "all"})
+                break
+
+    # All categories should be X / set all categories to X.
+    cat_patterns = [
+        r"(?:make|set|change|update)\s+(?:all|every)\s+categor(?:y|ies)\s+(?:to|as)\s+[\"'“”]?([^\.;\n]+)",
+        r"(?:all|every)\s+categor(?:y|ies)\s+(?:should|must|need to|needs to)?\s*(?:be|=|to)\s+[\"'“”]?([^\.;\n]+)",
+        r"(?:categor(?:y|ies))\s+(?:should|must|need to|needs to)?\s*(?:be|=|to)\s+[\"'“”]?([^\.;\n]+)",
+    ]
+    for pat in cat_patterns:
+        m = re.search(pat, text, flags=re.I)
+        if m:
+            val = _instruction_clean_target_value(m.group(1))
+            val = re.sub(r"[\"'“”]+$", "", val).strip()
+            if val and not re.search(r"\b(named|called)\b$", val, flags=re.I):
+                rules.append({"action": "set_field", "field": "category", "value": val, "scope": "all"})
+                break
+
+    # Rename all items/products to X.
+    name_patterns = [
+        r"(?:rename|name|call)\s+(?:all|every)\s+(?:items?|products?|rows?)\s+(?:to|as)?\s+[\"'“”]?([^\.;\n]+)",
+        r"(?:all|every)\s+(?:items?|products?)\s+(?:should|must|need to|needs to)?\s*(?:be named|be called|named|called|=|to)\s+[\"'“”]?([^\.;\n]+)",
+    ]
+    for pat in name_patterns:
+        m = re.search(pat, text, flags=re.I)
+        if m:
+            val = _instruction_clean_target_value(m.group(1))
+            val = re.sub(r"[\"'“”]+$", "", val).strip()
+            if val:
+                rules.append({"action": "set_field", "field": "product_name", "value": val, "scope": "all"})
+                break
+
+    # Only extract X / only keep X.
+    m = re.search(r"\b(?:only\s+(?:extract|keep|include|show)|extract\s+only|keep\s+only)\s+([^\.;\n]+)", text, flags=re.I)
+    if m:
+        term = normalise_for_compare(re.sub(r"\b(products?|items?|rows?|please)\b", " ", m.group(1), flags=re.I))
+        if term and term not in {"all", "everything"}:
+            rules.append({"action": "filter_include", "term": term})
+
+    # Add / remove VAT.
+    if re.search(r"\b(?:vat|tax)\b", norm):
+        if re.search(r"\b(?:no|disable|off|exclude|without|remove)\b.*\b(?:vat|tax)\b|\b(?:vat|tax)\b.*\b(?:no|disable|off|exclude|without|remove)\b", norm):
+            rules.append({"action": "set_field", "field": "vat_enabled", "value": "No", "scope": "all"})
+        elif re.search(r"\b(?:yes|enable|on|include|inclusive|including)\b.*\b(?:vat|tax)\b|\b(?:vat|tax)\b.*\b(?:yes|enable|on|include|inclusive|including)\b", norm):
+            rules.append({"action": "set_field", "field": "vat_enabled", "value": "Yes", "scope": "all"})
+
+    # Track stock on/off.
+    if re.search(r"\btrack\s+stock\b|\bstock\s+tracking\b", norm):
+        if re.search(r"\b(?:do not|dont|don t|no|disable|off|without|remove)\b.*(?:track stock|stock tracking)|(?:track stock|stock tracking).*\b(?:no|disable|off|without)\b", norm):
+            rules.append({"action": "set_field", "field": "track_stock", "value": "No", "scope": "all"})
+        elif re.search(r"\b(?:enable|on|yes)\b.*(?:track stock|stock tracking)|(?:track stock|stock tracking).*\b(?:enable|on|yes)\b", norm):
+            rules.append({"action": "set_field", "field": "track_stock", "value": "Product", "scope": "all"})
+
+    return rules
+
+
+def _instruction_haystack(row: Dict[str, Any]) -> str:
+    return normalise_for_compare(" ".join([
+        title_value(row),
+        normalise_text(row.get("category") or row.get("Category")),
+        normalise_text(row.get("description") or row.get("Description")),
+        normalise_text(row.get("brand") or row.get("Brand")),
+        normalise_text(row.get("barcode") or row.get("Barcode")),
+        normalise_text(row.get("sku") or row.get("SKU")),
+    ]))
+
+
+def _set_instruction_field(row: Dict[str, Any], field: str, value: Any) -> bool:
+    field_aliases = {
+        "product_name": ["product_name", "Product Name"],
+        "category": ["category", "Category", "active_category", "_active_category"],
+        "vat_enabled": ["vat_enabled", "VAT Enabled"],
+        "track_stock": ["track_stock", "Track Stock"],
+        "brand": ["brand", "Brand"],
+        "description": ["description", "Description"],
+        "barcode": ["barcode", "Barcode"],
+        "sku": ["sku", "SKU"],
+    }
+    changed = False
+    for key in field_aliases.get(field, [field]):
+        if row.get(key) != value:
+            row[key] = value
+            changed = True
+    if field == "product_name":
+        # Regenerate product ID from the new name. preflight will still disambiguate duplicates safely.
+        set_product_id(row, slugify(value or best_code(row) or "product"))
+    if field == "category":
+        # Existing composite keys include category; clear cached identity so it can be rebuilt.
+        for key in ["category_code_key", "composite_key", "retail_identity_key", "unique_id"]:
+            row.pop(key, None)
+    return changed
+
+
+def _set_instruction_price(row: Dict[str, Any], price: float) -> bool:
+    price = round(float(price), 2)
+    keys = [
+        "selling_price", "calculated_price", "variant_price", "price",
+        "Default Price", "Variant Price",
+    ]
+    changed = False
+    for key in keys:
+        if row.get(key) != price:
+            row[key] = price
+            changed = True
+    # Critical: get_price() trusts this cache. Keep it in sync or later preflight
+    # will resurrect the original extracted price.
+    row["_price"] = price
+    return changed
+
+
+def _apply_compiled_instruction_rules(products: List[Dict[str, Any]], rules: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    if not rules:
+        return products, {"compiled_instruction_rules": [], "compiled_instruction_changed": 0, "compiled_instruction_removed": 0}
+
+    out: List[Dict[str, Any]] = []
+    changed = 0
+    removed = 0
+
+    for original in products:
+        row = dict(original)
+        keep = True
+        for rule in rules:
+            action = rule.get("action")
+            if action == "filter_include":
+                term = normalise_for_compare(rule.get("term"))
+                if term and term not in _instruction_haystack(row):
+                    keep = False
+                    break
+            elif action == "set_price":
+                if _set_instruction_price(row, float(rule.get("value", 0))):
+                    changed += 1
+            elif action == "set_field":
+                if _set_instruction_field(row, str(rule.get("field") or ""), rule.get("value")):
+                    changed += 1
+        if keep:
+            out.append(row)
+        else:
+            removed += 1
+
+    return out, {
+        "compiled_instruction_rules": rules,
+        "compiled_instruction_changed": changed,
+        "compiled_instruction_removed": removed,
+    }
+
 def apply_ai_instruction_postprocess(products, user_instructions="", vat_enabled="Yes", track_stock_enabled=True, gemini_api_key=""):
     """Apply AI instructions to spreadsheet-extracted rows.
 
@@ -3612,6 +3805,22 @@ def apply_ai_instruction_postprocess(products, user_instructions="", vat_enabled
             "ai_instruction_stock_filled": stock_filled,
             "ai_instructions_applied": False,
         }
+
+    compiled_rules = _compile_deterministic_instruction_rules(raw_instructions)
+    if compiled_rules:
+        compiled_products, compiled_meta = _apply_compiled_instruction_rules(out_default, compiled_rules)
+        compiled_meta.update({
+            "ai_instruction_barcodes_filled": barcode_filled,
+            "ai_instruction_stock_filled": stock_filled,
+            "ai_instruction_categories_inferred": categories_inferred,
+            "ai_instruction_rows_removed": compiled_meta.get("compiled_instruction_removed", 0),
+            "ai_instruction_exclusion_terms": [],
+            "ai_instruction_categories_renamed": 0,
+            "ai_instruction_names_cleaned": 0,
+            "ai_instructions_applied": True,
+            "ai_instruction_summary": "Applied deterministic instruction rules.",
+        })
+        return compiled_products, compiled_meta
 
     api_key_available = bool(
         str(gemini_api_key or "").strip()
@@ -3932,7 +4141,7 @@ def _drive_get_access_token() -> Optional[str]:
     header = base64.urlsafe_b64encode(json.dumps({"alg": "RS256", "typ": "JWT"}).encode()).rstrip(b"=")
     payload = base64.urlsafe_b64encode(json.dumps({
         "iss": client_email,
-        "scope": "https://www.googleapis.com/auth/drive.file",
+        "scope": "https://www.googleapis.com/auth/drive",
         "aud": token_uri,
         "iat": now,
         "exp": now + 3600,
@@ -3984,25 +4193,126 @@ def _drive_get_access_token() -> Optional[str]:
     return token
 
 
-def drive_upload_file(filename: str, file_bytes: bytes, mime_type: str = "application/octet-stream") -> Dict[str, Any]:
-    """Upload a file to the Google Drive folder set in GOOGLE_DRIVE_FOLDER_ID.
-
-    Returns a structured result instead of only None. This lets the frontend and
-    dashboard show a clear warning when Drive is not configured, the API is
-    disabled, or the folder permissions are wrong.
-    """
+def _drive_upload_http(filename: str, file_bytes: bytes, mime_type: str, parent_id: str, token: str) -> Dict[str, Any]:
+    """Upload to one specific Drive parent/folder, including Shared Drive support."""
     import urllib.request
     import urllib.error
 
-    folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "1ifWvjJ9c_r_H3B919qXSHaOwMuwMdEjK").strip()
-    if not folder_id:
+    parent_id = normalise_text(parent_id)
+    if not parent_id:
         return {
             "ok": False,
             "status": "skipped",
             "file_id": None,
             "file_url": None,
-            "error": "GOOGLE_DRIVE_FOLDER_ID is not set.",
+            "error": "No Google Drive parent folder or shared drive ID was provided.",
         }
+
+    boundary = "drive_upload_boundary_x7k2"
+    meta = json.dumps({
+        "name": filename,
+        "parents": [parent_id],
+    }).encode("utf-8")
+
+    body = (
+        f"--{boundary}\r\n"
+        f"Content-Type: application/json; charset=UTF-8\r\n\r\n"
+    ).encode() + meta + (
+        f"\r\n--{boundary}\r\n"
+        f"Content-Type: {mime_type}\r\n\r\n"
+    ).encode() + file_bytes + f"\r\n--{boundary}--".encode()
+
+    upload_url = (
+        "https://www.googleapis.com/upload/drive/v3/files"
+        "?uploadType=multipart"
+        "&supportsAllDrives=true"
+        "&fields=id,name,webViewLink,parents,driveId"
+    )
+
+    req = urllib.request.Request(
+        upload_url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": f"multipart/related; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+            file_id = result.get("id")
+            file_url = result.get("webViewLink") or (f"https://drive.google.com/file/d/{file_id}/view" if file_id else None)
+            app.logger.info("Drive upload OK: %s -> %s parent=%s driveId=%s", filename, file_id, parent_id, result.get("driveId"))
+            return {
+                "ok": True,
+                "status": "uploaded",
+                "file_id": file_id,
+                "file_url": file_url,
+                "error": None,
+                "target_parent_id": parent_id,
+                "drive_id": result.get("driveId"),
+            }
+    except urllib.error.HTTPError as e:
+        raw_body = e.read().decode("utf-8", errors="replace")
+        short_body = raw_body[:1000]
+        message = short_body
+        reason = ""
+        try:
+            parsed = json.loads(raw_body)
+            err = parsed.get("error", {})
+            message = err.get("message") or short_body
+            errors = err.get("errors") or []
+            if errors and isinstance(errors, list):
+                reason = errors[0].get("reason") or ""
+        except Exception:
+            pass
+
+        project_match = re.search(r"project\s+(\d+)", message, flags=re.I)
+        project_number = project_match.group(1) if project_match else ""
+        help_url = (
+            f"https://console.developers.google.com/apis/api/drive.googleapis.com/overview?project={project_number}"
+            if project_number else
+            "https://console.developers.google.com/apis/api/drive.googleapis.com/overview"
+        )
+        app.logger.warning("Drive upload HTTP %s for %s parent=%s: %s", e.code, filename, parent_id, short_body)
+        return {
+            "ok": False,
+            "status": "failed",
+            "http_status": e.code,
+            "file_id": None,
+            "file_url": None,
+            "error": message,
+            "reason": reason,
+            "help_url": help_url if e.code == 403 else None,
+            "project_number": project_number or None,
+            "target_parent_id": parent_id,
+        }
+    except Exception as exc:
+        app.logger.warning("Drive upload failed for %s parent=%s: %s", filename, parent_id, exc)
+        return {
+            "ok": False,
+            "status": "failed",
+            "file_id": None,
+            "file_url": None,
+            "error": str(exc),
+            "target_parent_id": parent_id,
+        }
+
+
+def drive_upload_file(filename: str, file_bytes: bytes, mime_type: str = "application/octet-stream") -> Dict[str, Any]:
+    """Upload a file to Google Drive, preferring a Shared Drive target.
+
+    Service accounts do not have their own Google Drive storage quota. If an
+    upload is attempted without a valid Shared Drive/folder parent, Google
+    returns storageQuotaExceeded. This function supports Shared Drives by using
+    supportsAllDrives=true and by retrying against GOOGLE_SHARED_DRIVE_ID or the
+    built-in shared drive fallback when the first parent hits that quota error.
+    """
+    explicit_folder = normalise_text(os.environ.get("GOOGLE_DRIVE_FOLDER_ID", ""))
+    shared_drive_id = normalise_text(os.environ.get("GOOGLE_SHARED_DRIVE_ID", "")) or "0ACjRRbj4UBETUk9PVA"
 
     token = _drive_get_access_token()
     if not token:
@@ -4014,77 +4324,63 @@ def drive_upload_file(filename: str, file_bytes: bytes, mime_type: str = "applic
             "error": "Google Drive service account is not configured or could not mint an access token.",
         }
 
-    boundary = "drive_upload_boundary_x7k2"
-    meta = json.dumps({"name": filename, "parents": [folder_id]}).encode()
+    # Try the explicit folder first only if it is configured. Otherwise go
+    # straight to the shared drive fallback so service-account uploads do not
+    # accidentally target the service account's quota-less My Drive.
+    target_ids: List[str] = []
+    if explicit_folder:
+        target_ids.append(explicit_folder)
+    if shared_drive_id and shared_drive_id not in target_ids:
+        target_ids.append(shared_drive_id)
 
-    body = (
-        f"--{boundary}\r\n"
-        f"Content-Type: application/json; charset=UTF-8\r\n\r\n"
-    ).encode() + meta + (
-        f"\r\n--{boundary}\r\n"
-        f"Content-Type: {mime_type}\r\n\r\n"
-    ).encode() + file_bytes + f"\r\n--{boundary}--".encode()
-
-    req = urllib.request.Request(
-        "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": f"multipart/related; boundary={boundary}",
-            "Content-Length": str(len(body)),
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            result = json.loads(resp.read())
-            file_id = result.get("id")
-            file_url = result.get("webViewLink") or (f"https://drive.google.com/file/d/{file_id}/view" if file_id else None)
-            app.logger.info("Drive upload OK: %s -> %s", filename, file_id)
-            return {
-                "ok": True,
-                "status": "uploaded",
-                "file_id": file_id,
-                "file_url": file_url,
-                "error": None,
-            }
-    except urllib.error.HTTPError as e:
-        raw_body = e.read().decode("utf-8", errors="replace")
-        short_body = raw_body[:1000]
-        message = short_body
-        try:
-            parsed = json.loads(raw_body)
-            message = parsed.get("error", {}).get("message") or short_body
-        except Exception:
-            pass
-
-        project_match = re.search(r"project\s+(\d+)", message, flags=re.I)
-        project_number = project_match.group(1) if project_match else ""
-        help_url = (
-            f"https://console.developers.google.com/apis/api/drive.googleapis.com/overview?project={project_number}"
-            if project_number else
-            "https://console.developers.google.com/apis/api/drive.googleapis.com/overview"
-        )
-        app.logger.warning("Drive upload HTTP %s for %s: %s", e.code, filename, short_body)
+    if not target_ids:
         return {
             "ok": False,
-            "status": "failed",
-            "http_status": e.code,
+            "status": "skipped",
             "file_id": None,
             "file_url": None,
-            "error": message,
-            "help_url": help_url if e.code == 403 else None,
-            "project_number": project_number or None,
+            "error": "Google Drive backup is not configured. Set GOOGLE_SHARED_DRIVE_ID or GOOGLE_DRIVE_FOLDER_ID.",
         }
-    except Exception as exc:
-        app.logger.warning("Drive upload failed for %s: %s", filename, exc)
-        return {
-            "ok": False,
-            "status": "failed",
-            "file_id": None,
-            "file_url": None,
-            "error": str(exc),
-        }
+
+    attempts = []
+    for parent_id in target_ids:
+        result = _drive_upload_http(filename, file_bytes, mime_type, parent_id, token)
+        attempts.append({
+            "parent_id": parent_id,
+            "ok": bool(result.get("ok")),
+            "status": result.get("status"),
+            "http_status": result.get("http_status"),
+            "reason": result.get("reason"),
+            "error": result.get("error"),
+        })
+        if result.get("ok"):
+            result["attempts"] = attempts
+            return result
+
+        error_text = (str(result.get("error") or "") + " " + str(result.get("reason") or "")).lower()
+        quota_error = "storage quota" in error_text or "storagequotaexceeded" in error_text
+        # Only continue to fallback parent on the quota problem this workaround is for.
+        if not quota_error:
+            result["attempts"] = attempts
+            return result
+
+    final = attempts[-1] if attempts else {}
+    return {
+        "ok": False,
+        "status": "failed",
+        "file_id": None,
+        "file_url": None,
+        "error": (
+            "Google Drive upload failed because the service account has no My Drive quota. "
+            "The upload was retried against the Shared Drive fallback. Make sure the SERVICE ACCOUNT EMAIL, "
+            "not only your user account, is a member of the Shared Drive or a folder inside it with Contributor, "
+            "Content manager, or Manager access."
+        ),
+        "reason": final.get("reason"),
+        "http_status": final.get("http_status"),
+        "target_parent_id": final.get("parent_id"),
+        "attempts": attempts,
+    }
 
 
 @app.get("/")
@@ -4105,9 +4401,44 @@ def health_check():
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "service": "Yoco retail file processor"})
+    return jsonify({"status": "ok", "service": "Yoco retail file processor", "version": APP_VERSION})
 
 
+
+
+
+@app.get("/debug-drive-config")
+def debug_drive_config():
+    """Runtime diagnostic to confirm the deployed backend is the updated build.
+
+    Does not expose private keys. It only shows which Drive target ids the app
+    will try and the service account client email, so deployment/env mistakes are
+    easy to spot from the browser.
+    """
+    explicit_folder = normalise_text(os.environ.get("GOOGLE_DRIVE_FOLDER_ID", ""))
+    shared_drive_id = normalise_text(os.environ.get("GOOGLE_SHARED_DRIVE_ID", "")) or "0ACjRRbj4UBETUk9PVA"
+    raw_sa = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    client_email = ""
+    has_private_key = False
+    if raw_sa:
+        try:
+            parsed = json.loads(raw_sa)
+            client_email = parsed.get("client_email", "")
+            has_private_key = bool(parsed.get("private_key"))
+        except Exception:
+            client_email = "Invalid GOOGLE_SERVICE_ACCOUNT_JSON"
+    return cors_json({
+        "status": "ok",
+        "version": APP_VERSION,
+        "drive_upload_code": "shared-drive-supportsAllDrives-v2",
+        "google_service_account_configured": bool(raw_sa),
+        "google_service_account_email": client_email,
+        "google_service_account_has_private_key": has_private_key,
+        "google_drive_folder_id": explicit_folder,
+        "google_shared_drive_id": shared_drive_id,
+        "target_order": [x for x in [explicit_folder, shared_drive_id] if x],
+        "note": "If logs do not include parent=... on Drive upload warnings, the deployed backend is still the old app.py.",
+    })
 
 
 @app.post("/debug-upload")
@@ -4166,7 +4497,7 @@ def process_retail_file_json():
             "status": "skipped",
             "file_id": None,
             "file_url": None,
-            "error": "Google Drive backup is not configured. Set GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_DRIVE_FOLDER_ID.",
+            "error": "Google Drive backup is not configured. Set GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_SHARED_DRIVE_ID or GOOGLE_DRIVE_FOLDER_ID.",
         }
         if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
             drive_upload = drive_upload_file(filename, file_bytes, mime_type)
