@@ -1015,15 +1015,77 @@ def _variant_axis_values(row: Dict[str, Any]) -> Tuple[Tuple[str, str], Tuple[st
     )
 
 
-def normalise_sparse_variant_matrices_for_yoco(products: List[Dict[str, Any]]) -> int:
-    """Collapse sparse multi-axis variant groups into one combined variant axis.
+def _append_variant_axis_value_to_title(title: Any, value: Any) -> str:
+    """Add a split-out option value to the product title only when useful."""
+    base = clean_product_title(title)
+    val = clean_product_title(value)
+    if not base:
+        return val
+    if not val:
+        return base
+    if normalise_for_compare(val) in normalise_for_compare(base):
+        return base
+    return clean_product_title(f"{base} - {val}")
 
-    Yoco import validates variant groups as a full matrix when Attribute 1/2/3 are
-    present. Shopify exports often contain sparse combinations, e.g. 3 colours x
-    7 sizes = 21 possible variants, but only 19 rows exist. Yoco then rejects the
-    file with "Invalid amount of variants passed". To preserve the actual sellable
-    rows without inventing missing variants, collapse sparse multi-axis groups into
-    a single Attribute 1 value such as "Red / XL".
+
+def _rewrite_variant_axes_after_dropping_axis(row: Dict[str, Any], drop_axis_idx: int) -> None:
+    """Shift Attribute/Value columns left after removing one option axis."""
+    remaining: List[Tuple[str, str]] = []
+    for idx in range(1, 4):
+        if idx == drop_axis_idx:
+            continue
+        name = normalise_text(row.get(f"attr{idx}_name") or row.get(f"Attribute {idx}"))
+        value = normalise_text(row.get(f"attr{idx}_val") or row.get(f"Value {idx}"))
+        if name or value:
+            remaining.append((name or f"Option {len(remaining) + 1}", value))
+
+    clear_variant_attributes(row)
+    if not remaining:
+        set_variant_fields(row, False)
+        row["track_stock"] = row["Track Stock"] = "Product"
+        return
+
+    set_variant_fields(row, True)
+    for dest_idx, (name, value) in enumerate(remaining[:3], start=1):
+        row[f"attr{dest_idx}_name"] = row[f"Attribute {dest_idx}"] = name
+        row[f"attr{dest_idx}_val"] = row[f"Value {dest_idx}"] = value
+
+
+def _set_default_price_by_product_id(rows: List[Dict[str, Any]]) -> None:
+    """Keep Yoco product-level Default Price consistent per variant product."""
+    by_pid: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        pid = product_id_value(row)
+        if pid:
+            by_pid.setdefault(pid, []).append(row)
+    for group_rows in by_pid.values():
+        if not any(row_is_variant(row) for row in group_rows):
+            continue
+        prices = [get_price(row) for row in group_rows if get_price(row) > 0]
+        default_price = round(min(prices), 2) if prices else 0.0
+        for row in group_rows:
+            row["selling_price"] = row["Default Price"] = default_price
+            row["calculated_price"] = row.get("calculated_price") or row.get("variant_price") or get_price(row) or default_price
+
+
+def normalise_sparse_variant_matrices_for_yoco(products: List[Dict[str, Any]]) -> int:
+    """Make Shopify/Yoco multi-option variant groups import-safe without muddling values.
+
+    The previous implementation collapsed sparse 2-axis Shopify variants into a
+    single combined axis, for example Attribute 1 = "Colour / Size" and
+    Value 1 = "olive / S / 36". That imports, but it is not a clean Yoco
+    variant structure and it makes the product look wrong.
+
+    This version keeps the real option structure by splitting sparse or
+    constant-leading-axis groups by the first option axis (normally Colour), then
+    moving that value into the product name/Product ID and shifting the remaining
+    axes left. Example:
+      Product: Men's Bush Shirt, Colour=olive, Size=S / 36
+      -> Product: Men's Bush Shirt - olive, Attribute 1=Size, Value 1=S / 36
+
+    Complete multi-axis groups are left alone. Sparse groups become separate
+    one-axis products, which avoids Yoco's full-matrix validation problem without
+    combining Colour and Size into one value.
     """
     groups: Dict[str, List[Dict[str, Any]]] = {}
     for row in products:
@@ -1034,65 +1096,64 @@ def normalise_sparse_variant_matrices_for_yoco(products: List[Dict[str, Any]]) -
             groups.setdefault(pid, []).append(row)
 
     changed = 0
+    touched_rows: List[Dict[str, Any]] = []
+
     for _pid, rows in groups.items():
         if len(rows) < 2:
             continue
-        axis_names: List[str] = []
-        axis_value_sets: List[set] = []
+
+        axes: List[Dict[str, Any]] = []
         for idx in range(1, 4):
             name_counts: Dict[str, int] = {}
-            values = set()
+            values: List[str] = []
+            seen_values = set()
             for row in rows:
                 name = normalise_text(row.get(f"attr{idx}_name") or row.get(f"Attribute {idx}"))
                 value = normalise_text(row.get(f"attr{idx}_val") or row.get(f"Value {idx}"))
                 if name:
                     name_counts[name] = name_counts.get(name, 0) + 1
-                if value and value.lower() not in {"default", "default title"}:
-                    values.add(value.lower())
+                value_key = value.lower()
+                if value and value_key not in {"default", "default title"} and value_key not in seen_values:
+                    seen_values.add(value_key)
+                    values.append(value)
             if values:
                 axis_name = sorted(name_counts.items(), key=lambda item: item[1], reverse=True)[0][0] if name_counts else f"Option {idx}"
-                axis_names.append(axis_name)
-                axis_value_sets.append(values)
+                axes.append({"idx": idx, "name": axis_name, "values": values})
 
-        if len(axis_value_sets) < 2:
+        if len(axes) < 2:
             continue
 
         expected = 1
-        for values in axis_value_sets:
-            expected *= max(1, len(values))
-        actual_combos = set()
-        for row in rows:
-            vals = []
-            for idx in range(1, len(axis_value_sets) + 1):
-                vals.append(normalise_text(row.get(f"attr{idx}_val") or row.get(f"Value {idx}")).lower())
-            actual_combos.add(tuple(vals))
+        for axis in axes:
+            expected *= max(1, len(axis["values"]))
+        actual_combos = {
+            tuple(normalise_text(row.get(f"attr{axis['idx']}_val") or row.get(f"Value {axis['idx']}")).lower() for axis in axes)
+            for row in rows
+        }
 
-        if len(actual_combos) >= expected:
+        first_axis = axes[0]
+        should_split_first_axis = len(first_axis["values"]) == 1 or len(actual_combos) < expected
+        if not should_split_first_axis:
             continue
 
-        combined_name = " / ".join([name for name in axis_names if name]) or "Variant"
-        seen_values: Dict[str, int] = {}
-        for row_index, row in enumerate(rows, start=1):
-            values = []
-            for idx in range(1, len(axis_value_sets) + 1):
-                value = normalise_text(row.get(f"attr{idx}_val") or row.get(f"Value {idx}"))
-                if value and value.lower() not in {"default", "default title"}:
-                    values.append(value)
-            combined_value = " / ".join(values) or f"Option {row_index}"
-            count = seen_values.get(combined_value.lower(), 0) + 1
-            seen_values[combined_value.lower()] = count
-            if count > 1:
-                combined_value = f"{combined_value} #{count}"
-            row["attr1_name"] = combined_name
-            row["Attribute 1"] = combined_name
-            row["attr1_val"] = combined_value
-            row["Value 1"] = combined_value
-            for idx in (2, 3):
-                row[f"attr{idx}_name"] = ""
-                row[f"Attribute {idx}"] = ""
-                row[f"attr{idx}_val"] = ""
-                row[f"Value {idx}"] = ""
+        split_idx = int(first_axis["idx"])
+        for row in rows:
+            split_value = normalise_text(row.get(f"attr{split_idx}_val") or row.get(f"Value {split_idx}"))
+            if not split_value:
+                continue
+            original_title = title_value(row)
+            original_pid = product_id_value(row) or slugify(original_title)
+            new_title = _append_variant_axis_value_to_title(original_title, split_value)
+            new_pid = slugify(f"{original_pid}-{split_value}")
+            set_title(row, new_title)
+            set_product_id(row, new_pid)
+            _rewrite_variant_axes_after_dropping_axis(row, split_idx)
+            touched_rows.append(row)
             changed += 1
+
+    if touched_rows:
+        _set_default_price_by_product_id(touched_rows)
+
     return changed
 
 
@@ -3364,6 +3425,12 @@ def product_to_yoco_row(row: Dict[str, Any], track_stock: str = "Product", vat_e
     if variant_enabled != "Yes":
         default_price = variant_price
 
+    row_track_stock = normalise_text(row.get("track_stock") or row.get("Track Stock"))
+    if not row_track_stock:
+        row_track_stock = "Variant" if variant_enabled == "Yes" else track_stock
+
+    default_quantity = normalise_text(row.get("quantity") or row.get("Default Quantity") or row.get("default_quantity")) or "1"
+
     return {
         "Product ID": product_id,
         "Product Name": product_name,
@@ -3374,7 +3441,7 @@ def product_to_yoco_row(row: Dict[str, Any], track_stock: str = "Product", vat_e
         "SKU": normalise_text(row.get("sku") or row.get("SKU") or code),
         "Default Cost Price": cost,
         "Ask For Quantity": "No",
-        "Default Quantity": normalise_text(row.get("quantity") or row.get("Default Quantity")),
+        "Default Quantity": default_quantity,
         "Quantity Units": normalise_text(row.get("quantity_units") or row.get("Quantity Units")),
         "Ask For Price": "No",
         "VAT Enabled": vat_enabled,
@@ -3388,7 +3455,7 @@ def product_to_yoco_row(row: Dict[str, Any], track_stock: str = "Product", vat_e
         "Value 3": normalise_text(row.get("attr3_val") or row.get("Value 3")),
         "Image URL": normalise_text(row.get("image_url") or row.get("Image URL")),
         "Barcode": code,
-        "Track Stock": track_stock,
+        "Track Stock": row_track_stock,
         "Modifier Group": normalise_text(row.get("modifier_group") or row.get("Modifier Group")),
     }
 
@@ -3557,6 +3624,8 @@ def process_retail_file_xlsx():
         raw_products, layout_meta = parse_uploaded_file_ai_assisted(uploaded_file, parse_mode=parse_mode, gemini_api_key=gemini_api_key)
         raw_products = apply_parse_mode(raw_products, parse_mode)
         products = preflight_products_for_frontend(raw_products)
+        normalise_sparse_variant_matrices_for_yoco(products)
+        make_skus_unique_for_yoco(products)
         enrich_remaining_duplicate_product_ids(products)
         output = products_to_workbook(products)
         return send_file(
@@ -3595,6 +3664,8 @@ def export_yoco_file():
         if parse_mode:
             products = apply_parse_mode(products, parse_mode)
         products = preflight_products_for_frontend(products)
+        normalise_sparse_variant_matrices_for_yoco(products)
+        make_skus_unique_for_yoco(products)
         output = products_to_workbook(products)
         return send_file(
             output,
