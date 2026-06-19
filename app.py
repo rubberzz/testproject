@@ -3324,6 +3324,7 @@ _CATEGORY_KEYWORDS = [
 ]
 
 
+
 def infer_category_from_title_for_instructions(row: Dict[str, Any]) -> str:
     text = normalise_for_compare(" ".join([
         title_value(row),
@@ -3336,6 +3337,59 @@ def infer_category_from_title_for_instructions(row: Dict[str, Any]) -> str:
         if any(word in text for word in words):
             return category
     return ""
+
+
+def _instruction_rename_rules(user_instructions: str) -> List[tuple]:
+    """Extract category rename rules from operator instructions.
+
+    Supported natural language patterns:
+      - rename wine to best wines
+      - rename category spirits to top spirits
+      - rename "wine" to "best wines"
+      - change wine category to best wines
+      - call wine "best wines"
+      - wine → best wines
+      - wine -> best wines
+      - wine = best wines
+    Returns a list of (from_normalised, to_display) tuples.
+    """
+    text = user_instructions.strip()
+    if not text:
+        return []
+
+    rules: List[tuple] = []
+    seen: set = set()
+
+    patterns = [
+        # rename [category] X to Y  /  rename X [category] to Y
+        r"rename\s+(?:category\s+)?[\"']?([^\"'\n\-–>=/]+?)[\"']?\s+(?:category\s+)?to\s+[\"']?([^\"'\n;]+?)[\"']?\s*(?:;|$|\n)",
+        # change X [category] to Y  /  change category X to Y
+        r"change\s+(?:category\s+)?[\"']?([^\"'\n\-–>=/]+?)[\"']?\s+(?:category\s+)?to\s+[\"']?([^\"'\n;]+?)[\"']?\s*(?:;|$|\n)",
+        # call X Y  /  call X "Y"
+        r"call\s+[\"']?([^\"'\n\-–>=/]+?)[\"']?\s+[\"']([^\"'\n]+)[\"']",
+        # X → Y  /  X -> Y
+        r"[\"']?([^\"'\n\-–>=/]{2,40}?)[\"']?\s*(?:→|->)\s*[\"']?([^\"'\n;]{2,60}?)[\"']?\s*(?:;|$|\n)",
+        # X = Y  (only when used in rename context; guarded by leading keyword)
+        r"rename\s+[\"']?([^\"'\n=]{2,40}?)[\"']?\s*=\s*[\"']?([^\"'\n;]{2,60}?)[\"']?\s*(?:;|$|\n)",
+    ]
+
+    # Normalise whitespace and ensure trailing newline so $ anchors work
+    normalised = re.sub(r"[ \t]+", " ", text.lower()) + "\n"
+
+    for pat in patterns:
+        for m in re.finditer(pat, normalised, flags=re.I):
+            frm = m.group(1).strip().strip("\"'")
+            to = m.group(2).strip().strip("\"'")
+            frm_key = normalise_for_compare(frm)
+            if frm_key and to and frm_key not in seen and len(frm_key) >= 2:
+                seen.add(frm_key)
+                # Preserve original casing from user input for the display value
+                # Find the original casing in the raw input
+                raw_match = re.search(re.escape(to), text, flags=re.I)
+                display_to = raw_match.group(0) if raw_match else to.title()
+                rules.append((frm_key, display_to))
+
+    return rules
 
 
 def _instruction_exclusion_terms(user_instructions: str) -> List[str]:
@@ -3367,18 +3421,34 @@ def _instruction_exclusion_terms(user_instructions: str) -> List[str]:
     return out
 
 
-def apply_ai_instruction_postprocess(products: List[Dict[str, Any]], user_instructions: str = "", vat_enabled: str = "Yes", track_stock_enabled: bool = True) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def apply_ai_instruction_postprocess(products: List[Dict[str, Any]], user_instructions: str = "", vat_enabled: str = "Yes", track_stock_enabled: bool = True, gemini_api_key: str = "") -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Apply the dashboard AI-instruction controls to deterministic Python rows.
 
-    The visual AI instruction box already affects image/PDF Gemini extraction through
-    buildPrompt(). Spreadsheet uploads use this backend, so the same instructions need
-    to be applied here too.
+    The HTML chat window calls Gemini Canvas AI to interpret the user's raw instructions
+    into precise directives before storing them. By the time instructions reach this
+    function (via the user_instructions form field), they are already AI-clarified.
+    This function applies those clarified directives to spreadsheet-extracted rows.
     """
-    instructions = normalise_text(user_instructions)
+    raw_instructions = (user_instructions or "").strip()
+    if not raw_instructions:
+        return products, {
+            "ai_instruction_rows_removed": 0,
+            "ai_instruction_exclusion_terms": [],
+            "ai_instruction_categories_inferred": 0,
+            "ai_instruction_categories_renamed": 0,
+            "ai_instruction_names_cleaned": 0,
+            "ai_instruction_barcodes_filled": 0,
+            "ai_instruction_stock_filled": 0,
+            "ai_instructions_applied": False,
+        }
+
+    instructions = normalise_text(raw_instructions)
     exclusions = _instruction_exclusion_terms(instructions)
+    rename_rules = _instruction_rename_rules(user_instructions)
     out: List[Dict[str, Any]] = []
     removed = 0
     categories_inferred = 0
+    categories_renamed = 0
     cleaned_names = 0
     barcode_filled = 0
     stock_filled = 0
@@ -3406,6 +3476,22 @@ def apply_ai_instruction_postprocess(products: List[Dict[str, Any]], user_instru
             if inferred:
                 row["category"] = row["Category"] = inferred
                 categories_inferred += 1
+                category = inferred
+
+        # Apply rename rules: match current category against each rule's from-key.
+        if rename_rules and category:
+            cat_key = normalise_for_compare(category)
+            for frm_key, to_display in rename_rules:
+                if frm_key in cat_key or cat_key in frm_key:
+                    row["category"] = to_display
+                    row["Category"] = to_display
+                    # Also update active_category fields used in composite key
+                    if row.get("active_category"):
+                        row["active_category"] = to_display
+                    if row.get("_active_category"):
+                        row["_active_category"] = to_display
+                    categories_renamed += 1
+                    break
 
         code = best_code(row)
         if code:
@@ -3427,6 +3513,7 @@ def apply_ai_instruction_postprocess(products: List[Dict[str, Any]], user_instru
         "ai_instruction_rows_removed": removed,
         "ai_instruction_exclusion_terms": exclusions,
         "ai_instruction_categories_inferred": categories_inferred,
+        "ai_instruction_categories_renamed": categories_renamed,
         "ai_instruction_names_cleaned": cleaned_names,
         "ai_instruction_barcodes_filled": barcode_filled,
         "ai_instruction_stock_filled": stock_filled,
@@ -3709,7 +3796,7 @@ def process_retail_file_json():
         vat_enabled = "Yes" if str(request.form.get("vat_enabled", "true")).lower() in {"true", "yes", "1", "y"} else "No"
         track_stock_enabled = str(request.form.get("track_stock", "true")).lower() in {"true", "yes", "1", "y"}
         raw_products, layout_meta = parse_uploaded_file_ai_assisted(uploaded_file, parse_mode=parse_mode, gemini_api_key=gemini_api_key, user_instructions=user_instructions)
-        raw_products, instruction_meta = apply_ai_instruction_postprocess(raw_products, user_instructions=user_instructions, vat_enabled=vat_enabled, track_stock_enabled=track_stock_enabled)
+        raw_products, instruction_meta = apply_ai_instruction_postprocess(raw_products, user_instructions=user_instructions, vat_enabled=vat_enabled, track_stock_enabled=track_stock_enabled, gemini_api_key=gemini_api_key)
         payload = preflight_products_payload(raw_products, parse_mode=parse_mode)
         products = payload["products"]
         issues = build_issues(products)
@@ -3769,7 +3856,7 @@ def process_retail_file_xlsx():
         vat_enabled = "Yes" if str(request.form.get("vat_enabled", "true")).lower() in {"true", "yes", "1", "y"} else "No"
         track_stock_enabled = str(request.form.get("track_stock", "true")).lower() in {"true", "yes", "1", "y"}
         raw_products, layout_meta = parse_uploaded_file_ai_assisted(uploaded_file, parse_mode=parse_mode, gemini_api_key=gemini_api_key, user_instructions=user_instructions)
-        raw_products, _instruction_meta = apply_ai_instruction_postprocess(raw_products, user_instructions=user_instructions, vat_enabled=vat_enabled, track_stock_enabled=track_stock_enabled)
+        raw_products, _instruction_meta = apply_ai_instruction_postprocess(raw_products, user_instructions=user_instructions, vat_enabled=vat_enabled, track_stock_enabled=track_stock_enabled, gemini_api_key=gemini_api_key)
         raw_products = apply_parse_mode(raw_products, parse_mode)
         products = preflight_products_for_frontend(raw_products)
         normalise_sparse_variant_matrices_for_yoco(products)
@@ -3853,6 +3940,7 @@ def resolve_price_conflict():
         "selected_row": payload.get("selected_row") or {},
     }
     return jsonify({"ok": True, "saved": PRICE_CONFLICT_DECISIONS[conflict_id]})
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
