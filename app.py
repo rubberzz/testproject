@@ -3259,6 +3259,58 @@ def process_retail_file_json():
         }, 500)
 
 
+@app.post("/transform-parse-mode")
+def transform_parse_mode():
+    """Transform already-extracted frontend rows between Variant and Single modes.
+
+    Expects JSON:
+    {
+      "products": [...current products plus optional pending conflict rows...],
+      "parse_mode": "single" | "variant"
+    }
+
+    This keeps mode switching after extraction real: the backend reapplies the
+    same parser/preflight/Yoco guardrails used during the original upload, then
+    returns the same compact dashboard payload shape as /process-retail-file-json.
+    """
+    payload = request.get_json(silent=True) or {}
+    products = payload.get("products")
+    if not isinstance(products, list):
+        return cors_json({"error": "JSON body must include products: []"}, 400)
+
+    try:
+        parse_mode = payload.get("parse_mode", "variant")
+        result = preflight_products_payload(products, parse_mode=parse_mode)
+        transformed = result.get("products", [])
+        issues = validate_products_for_frontend(transformed)
+        summary = result.get("summary", {})
+        summary.update({
+            "input_rows": len(products),
+            "product_rows": len(transformed),
+            "price_conflict_groups": len(result.get("price_conflicts", [])),
+            "mode_transform": True,
+            "parse_mode": normalise_parse_mode(parse_mode),
+        })
+
+        return cors_json({
+            "products": [compact_product_for_frontend(row) for row in transformed],
+            "price_conflicts": [
+                compact_conflict_for_frontend(conflict)
+                for conflict in result.get("price_conflicts", [])
+            ],
+            "issues": issues,
+            "summary": summary,
+        })
+    except Exception as exc:
+        import traceback
+        app.logger.exception("transform-parse-mode failed")
+        return cors_json({
+            "error": str(exc),
+            "type": exc.__class__.__name__,
+            "traceback_tail": traceback.format_exc().splitlines()[-12:],
+        }, 500)
+
+
 @app.post("/process-retail-file")
 def process_retail_file_xlsx():
     """Legacy/download endpoint: upload file, get Yoco XLSX back.
