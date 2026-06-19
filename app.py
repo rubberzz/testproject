@@ -3190,6 +3190,59 @@ def extract_products_with_ai_plan(raw_bytes: bytes, ext: str, plan: Dict[str, An
     return products
 
 
+
+def parse_known_structured_export_from_bytes(raw_bytes: bytes, ext: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Parse already-structured POS/e-commerce exports before AI planning.
+
+    Shopify/Yoco exports already contain explicit variant rows and option columns.
+    Sending them through the Gemini layout planner can flatten or miss variants,
+    especially when product-level cells are blank on continuation rows. This
+    fast path preserves the native row-per-variant structure and only falls back
+    to AI/general parsers for unstructured supplier price lists.
+    """
+    ext = normalise_text(ext).lower().strip().lstrip(".")
+    if ext not in {"xlsx", "xls", "xlsm", "xl"}:
+        return [], {"structured_export_detected": False}
+
+    engine = "openpyxl" if ext in {"xlsx", "xlsm"} else None
+    try:
+        sheets = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=None, dtype=object, header=None, engine=engine)
+    except Exception:
+        return [], {"structured_export_detected": False}
+
+    products: List[Dict[str, Any]] = []
+    detected_kinds: List[str] = []
+    detected_sheets: List[str] = []
+
+    for sheet_name, raw_df in sheets.items():
+        source_sheet = str(sheet_name)
+        if is_yoco_products_export_sheet(raw_df):
+            rows = parse_yoco_products_export_sheet(raw_df, source_sheet)
+            if rows:
+                products.extend(rows)
+                detected_kinds.append("yoco_products_export")
+                detected_sheets.append(source_sheet)
+            continue
+
+        if is_shopify_export_sheet(raw_df):
+            rows = parse_shopify_export_sheet(raw_df, source_sheet)
+            if rows:
+                products.extend(rows)
+                detected_kinds.append("shopify_products_export")
+                detected_sheets.append(source_sheet)
+            continue
+
+    if not products:
+        return [], {"structured_export_detected": False}
+
+    return products, {
+        "structured_export_detected": True,
+        "layout_strategy": "+".join(sorted(set(detected_kinds))) or "structured_export",
+        "structured_sheets": detected_sheets,
+        "structured_rows": len(products),
+        "ai_rows": 0,
+    }
+
 def parse_uploaded_file_ai_assisted(file_storage, parse_mode: str = "variant", gemini_api_key: str = "") -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """New architecture entrypoint.
 
@@ -3201,6 +3254,14 @@ def parse_uploaded_file_ai_assisted(file_storage, parse_mode: str = "variant", g
     filename = file_storage.filename or "upload"
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     raw_bytes = file_storage.read()
+
+    # Structured exports (Shopify/Yoco) already describe variants explicitly.
+    # Parse them directly before AI planning so continuation rows with blank
+    # product-level fields are not mistaken for non-variant/detail rows.
+    structured_products, structured_meta = parse_known_structured_export_from_bytes(raw_bytes, ext)
+    if structured_products:
+        return structured_products, structured_meta
+
     sample = workbook_sample_from_bytes(raw_bytes, ext)
     plan = call_gemini_layout_planner(sample, api_key_override=gemini_api_key)
     ai_products: List[Dict[str, Any]] = []
