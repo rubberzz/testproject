@@ -665,37 +665,77 @@ def split_price_conflicts(products: List[Dict[str, Any]]) -> Tuple[List[Dict[str
 
 
 
+# Case/pack detection must be conservative. Many product names contain
+# dimensions such as 100x150mm, 40*40*5mm, 6.00MM2X4+E or 25x300.
+# Those are NOT pack quantities. We only flag common retail case/pack
+# quantities, and only when the syntax looks like packaging language.
+_COMMON_PACK_QTYS = {6, 12, 18, 20, 24, 30, 36, 48}
+_PACK_WORDS = r"pack|case|carton|ctn|box|tray|dozen|pcs|pieces|units?|count"
 _PACK_MULTIPLIER_RE = re.compile(
-    r"(?<!\d)(?:x|×)\s*(\d{1,3})(?:\s*(?:pack|case|pcs|pieces|units?|ct|count))?\b",
+    rf"(?:^|[\s,;:/\-])(?:x|×)\s*(\d{{1,3}})(?:\s*(?:{_PACK_WORDS}))?(?=$|[\s,;:/\-])",
     re.I,
 )
 _PACK_WORD_RE = re.compile(
-    r"\b(\d{1,3})\s*(?:pack|case|pcs|pieces|units?|ct|count)\b",
+    rf"\b(\d{{1,3}})\s*(?:{_PACK_WORDS})\b",
+    re.I,
+)
+_PACK_OF_RE = re.compile(
+    rf"\b(?:pack|case|carton|ctn|box|tray)\s+of\s+(\d{{1,3}})\b",
+    re.I,
+)
+
+_DIMENSION_RE = re.compile(
+    r"\b\d+(?:[.,]\d+)?\s*(?:x|×|\*)\s*\d+(?:[.,]\d+)?(?:\s*(?:mm|cm|m|ml|l|kg|g|v|w))?",
     re.I,
 )
 
 
-def extract_pack_qty_from_text(text: Any) -> Optional[int]:
-    """Return a case/pack multiplier from names like '100ml x 24'.
+def _looks_like_dimension_context(value: str, start: int, end: int) -> bool:
+    """Return True when the matched x/× is part of a physical dimension."""
+    window = value[max(0, start - 18): min(len(value), end + 18)]
+    if _DIMENSION_RE.search(window):
+        return True
+    # Electrical / cable dimensions often look like MM2X4+E or 3CX2.5.
+    if re.search(r"\b(?:mm2|mm²|core|cable|surfix|pvc)\b", window, re.I):
+        return True
+    return False
 
-    Guardrails: only quantities >= 6 are considered case packs. This avoids
-    false positives on small multipacks and structural dimensions such as 25x300.
+
+def _is_common_pack_qty(qty: int) -> bool:
+    return qty in _COMMON_PACK_QTYS
+
+
+def extract_pack_qty_from_text(text: Any) -> Optional[int]:
+    """Return a conservative case/pack multiplier.
+
+    Flags clear pack/case syntax like:
+      - 100ml x 24
+      - x 12 pack
+      - 6 pack
+      - case of 24
+
+    Does NOT flag dimensions like:
+      - 100x150mm
+      - 40*40*5mm
+      - 6.00MM2X4+E
+      - 25x300
     """
     value = normalise_text(text)
     if not value:
         return None
-    match = _PACK_MULTIPLIER_RE.search(value)
-    if not match:
-        match = _PACK_WORD_RE.search(value)
-    if not match:
-        return None
-    try:
-        qty = int(match.group(1))
-    except Exception:
-        return None
-    if qty < 6:
-        return None
-    return qty
+
+    for regex in (_PACK_OF_RE, _PACK_WORD_RE, _PACK_MULTIPLIER_RE):
+        for match in regex.finditer(value):
+            try:
+                qty = int(match.group(1))
+            except Exception:
+                continue
+            if not _is_common_pack_qty(qty):
+                continue
+            if regex is _PACK_MULTIPLIER_RE and _looks_like_dimension_context(value, match.start(), match.end()):
+                continue
+            return qty
+    return None
 
 
 def extract_pack_qty(row: Dict[str, Any]) -> Optional[int]:
