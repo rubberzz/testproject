@@ -528,7 +528,14 @@ def true_duplicate_key(row: Dict[str, Any]) -> Tuple[str, str, str, str, float, 
     code = clean_code(row.get("_best_code") or best_code(row)).lower()
     category = normalise_text(row.get("active_category") or row.get("_active_category") or row.get("category") or row.get("Category") or row.get("source_sheet") or row.get("Source Sheet"))
     title_key = normalise_for_compare(title_value(row))
-    variant_key = normalise_for_compare(variant_label_for_row(row)) if row_is_variant(row) else ""
+    variant_key = normalise_for_compare("|".join([
+        normalise_text(row.get("attr1_name") or row.get("Attribute 1")),
+        normalise_text(row.get("attr1_val") or row.get("Value 1")),
+        normalise_text(row.get("attr2_name") or row.get("Attribute 2")),
+        normalise_text(row.get("attr2_val") or row.get("Value 2")),
+        normalise_text(row.get("attr3_name") or row.get("Attribute 3")),
+        normalise_text(row.get("attr3_val") or row.get("Value 3")),
+    ])) if row_is_variant(row) else ""
     identity = category_code_key(row) or code or f"{slugify(category) or 'uncategorised'}_{title_key}"
     return (
         identity,
@@ -831,12 +838,136 @@ def flag_case_pack_prices(products: List[Dict[str, Any]]) -> int:
         flagged += 1
     return flagged
 
+
+def _variant_axis_values(row: Dict[str, Any]) -> Tuple[Tuple[str, str], Tuple[str, str], Tuple[str, str]]:
+    return (
+        (normalise_text(row.get("attr1_name") or row.get("Attribute 1")), normalise_text(row.get("attr1_val") or row.get("Value 1"))),
+        (normalise_text(row.get("attr2_name") or row.get("Attribute 2")), normalise_text(row.get("attr2_val") or row.get("Value 2"))),
+        (normalise_text(row.get("attr3_name") or row.get("Attribute 3")), normalise_text(row.get("attr3_val") or row.get("Value 3"))),
+    )
+
+
+def normalise_sparse_variant_matrices_for_yoco(products: List[Dict[str, Any]]) -> int:
+    """Collapse sparse multi-axis variant groups into one combined variant axis.
+
+    Yoco import validates variant groups as a full matrix when Attribute 1/2/3 are
+    present. Shopify exports often contain sparse combinations, e.g. 3 colours x
+    7 sizes = 21 possible variants, but only 19 rows exist. Yoco then rejects the
+    file with "Invalid amount of variants passed". To preserve the actual sellable
+    rows without inventing missing variants, collapse sparse multi-axis groups into
+    a single Attribute 1 value such as "Red / XL".
+    """
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for row in products:
+        if not row_is_variant(row):
+            continue
+        pid = product_id_value(row)
+        if pid:
+            groups.setdefault(pid, []).append(row)
+
+    changed = 0
+    for _pid, rows in groups.items():
+        if len(rows) < 2:
+            continue
+        axis_names: List[str] = []
+        axis_value_sets: List[set] = []
+        for idx in range(1, 4):
+            name_counts: Dict[str, int] = {}
+            values = set()
+            for row in rows:
+                name = normalise_text(row.get(f"attr{idx}_name") or row.get(f"Attribute {idx}"))
+                value = normalise_text(row.get(f"attr{idx}_val") or row.get(f"Value {idx}"))
+                if name:
+                    name_counts[name] = name_counts.get(name, 0) + 1
+                if value and value.lower() not in {"default", "default title"}:
+                    values.add(value.lower())
+            if values:
+                axis_name = sorted(name_counts.items(), key=lambda item: item[1], reverse=True)[0][0] if name_counts else f"Option {idx}"
+                axis_names.append(axis_name)
+                axis_value_sets.append(values)
+
+        if len(axis_value_sets) < 2:
+            continue
+
+        expected = 1
+        for values in axis_value_sets:
+            expected *= max(1, len(values))
+        actual_combos = set()
+        for row in rows:
+            vals = []
+            for idx in range(1, len(axis_value_sets) + 1):
+                vals.append(normalise_text(row.get(f"attr{idx}_val") or row.get(f"Value {idx}")).lower())
+            actual_combos.add(tuple(vals))
+
+        if len(actual_combos) >= expected:
+            continue
+
+        combined_name = " / ".join([name for name in axis_names if name]) or "Variant"
+        seen_values: Dict[str, int] = {}
+        for row_index, row in enumerate(rows, start=1):
+            values = []
+            for idx in range(1, len(axis_value_sets) + 1):
+                value = normalise_text(row.get(f"attr{idx}_val") or row.get(f"Value {idx}"))
+                if value and value.lower() not in {"default", "default title"}:
+                    values.append(value)
+            combined_value = " / ".join(values) or f"Option {row_index}"
+            count = seen_values.get(combined_value.lower(), 0) + 1
+            seen_values[combined_value.lower()] = count
+            if count > 1:
+                combined_value = f"{combined_value} #{count}"
+            row["attr1_name"] = combined_name
+            row["Attribute 1"] = combined_name
+            row["attr1_val"] = combined_value
+            row["Value 1"] = combined_value
+            for idx in (2, 3):
+                row[f"attr{idx}_name"] = ""
+                row[f"Attribute {idx}"] = ""
+                row[f"attr{idx}_val"] = ""
+                row[f"Value {idx}"] = ""
+            changed += 1
+    return changed
+
+
+def make_skus_unique_for_yoco(products: List[Dict[str, Any]]) -> int:
+    """Yoco requires SKU to be unique across products/variants.
+
+    Preserve the first occurrence. Later duplicates are suffixed with a stable
+    variant/product identifier rather than silently dropped.
+    """
+    seen: Dict[str, int] = {}
+    changed = 0
+    for idx, row in enumerate(products, start=1):
+        sku = clean_code(row.get("sku") or row.get("SKU"))
+        if not sku:
+            continue
+        key = sku.lower()
+        if key not in seen:
+            seen[key] = 1
+            row["sku"] = sku
+            row["SKU"] = sku
+            continue
+        seen[key] += 1
+        suffix_source = variant_label_for_row(row) or product_id_value(row) or str(idx)
+        suffix = slugify(suffix_source) or str(seen[key])
+        new_sku = f"{sku}-{suffix}"
+        # Guard against duplicate suffixes too.
+        while new_sku.lower() in seen:
+            seen[key] += 1
+            new_sku = f"{sku}-{suffix}-{seen[key]}"
+        seen[new_sku.lower()] = 1
+        row["sku"] = new_sku
+        row["SKU"] = new_sku
+        changed += 1
+    return changed
+
 def preflight_products_payload(products: List[Dict[str, Any]], parse_mode: Any = "variant") -> Dict[str, Any]:
     """Full frontend payload preflight: apply mode, dedupe, enrich IDs, then group conflicts."""
     mode = normalise_parse_mode(parse_mode)
     before_count = len(products)
     products = apply_parse_mode(products, mode)
     cleaned = preflight_products_for_frontend(products)
+    normalised_sparse_variant_groups = normalise_sparse_variant_matrices_for_yoco(cleaned)
+    fixed_duplicate_skus = make_skus_unique_for_yoco(cleaned)
     flagged_case_packs = flag_case_pack_prices(cleaned)
     flat_products, price_conflicts = split_price_conflicts(cleaned)
     enriched_remaining_duplicate_ids = enrich_remaining_duplicate_product_ids(flat_products)
@@ -852,6 +983,8 @@ def preflight_products_payload(products: List[Dict[str, Any]], parse_mode: Any =
             "price_conflict_rows": conflict_rows,
             "enriched_remaining_duplicate_ids": enriched_remaining_duplicate_ids,
             "flagged_case_packs": flagged_case_packs,
+            "normalised_sparse_variant_groups": normalised_sparse_variant_groups,
+            "fixed_duplicate_skus": fixed_duplicate_skus,
             "parse_mode": mode,
         },
     }
