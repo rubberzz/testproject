@@ -3890,6 +3890,153 @@ def products_to_workbook(products: List[Dict[str, Any]]) -> io.BytesIO:
     return output
 
 
+def _drive_get_access_token() -> Optional[str]:
+    """Mint a short-lived Google OAuth access token from the service account JSON env var.
+
+    Uses only stdlib — no google-auth package needed.
+    The token is cached in-process for 55 minutes.
+    """
+    import base64
+    import hmac
+    import hashlib
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+    import time
+
+    # In-process cache: (token, expiry_ts)
+    cache = _drive_get_access_token.__dict__
+    if cache.get("token") and time.time() < cache.get("expiry", 0):
+        return cache["token"]
+
+    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if not sa_json:
+        return None
+
+    try:
+        sa = json.loads(sa_json)
+    except Exception:
+        app.logger.warning("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON")
+        return None
+
+    client_email = sa.get("client_email", "")
+    raw_key = sa.get("private_key", "")
+    token_uri = sa.get("token_uri", "https://oauth2.googleapis.com/token")
+
+    if not client_email or not raw_key:
+        app.logger.warning("Service account JSON missing client_email or private_key")
+        return None
+
+    # Build JWT  (RS256)
+    now = int(time.time())
+    header = base64.urlsafe_b64encode(json.dumps({"alg": "RS256", "typ": "JWT"}).encode()).rstrip(b"=")
+    payload = base64.urlsafe_b64encode(json.dumps({
+        "iss": client_email,
+        "scope": "https://www.googleapis.com/auth/drive.file",
+        "aud": token_uri,
+        "iat": now,
+        "exp": now + 3600,
+    }).encode()).rstrip(b"=")
+
+    signing_input = header + b"." + payload
+
+    # Sign with RSA-SHA256 using cryptography if available, fallback to rsa package
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+
+        private_key = serialization.load_pem_private_key(raw_key.encode(), password=None)
+        signature = private_key.sign(signing_input, asym_padding.PKCS1v15(), hashes.SHA256())
+    except ImportError:
+        try:
+            import rsa as rsa_lib
+            private_key = rsa_lib.PrivateKey.load_pkcs1_openssl_pem(raw_key.encode())
+            signature = rsa_lib.sign(signing_input, private_key, "SHA-256")
+        except ImportError:
+            app.logger.warning("Neither cryptography nor rsa package available for Drive JWT signing")
+            return None
+
+    jwt_token = signing_input + b"." + base64.urlsafe_b64encode(signature).rstrip(b"=")
+
+    # Exchange JWT for access token
+    body = urllib.parse.urlencode({
+        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        "assertion": jwt_token.decode(),
+    }).encode()
+
+    req = urllib.request.Request(
+        token_uri,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            token_data = json.loads(resp.read())
+    except Exception as exc:
+        app.logger.warning("Drive token exchange failed: %s", exc)
+        return None
+
+    token = token_data.get("access_token")
+    if token:
+        cache["token"] = token
+        cache["expiry"] = now + 3300  # cache for 55 min
+    return token
+
+
+def drive_upload_file(filename: str, file_bytes: bytes, mime_type: str = "application/octet-stream") -> Optional[str]:
+    """Upload a file to the Google Drive folder set in GOOGLE_DRIVE_FOLDER_ID.
+
+    Returns the Drive file ID on success, None on failure.
+    Runs silently — logs warnings but never raises, so it never breaks extraction.
+    """
+    import urllib.request
+    import urllib.error
+
+    folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "1ifWvjJ9c_r_H3B919qXSHaOwMuwMdEjK").strip()
+    if not folder_id:
+        return None
+
+    token = _drive_get_access_token()
+    if not token:
+        return None
+
+    # Multipart upload: metadata part + file part
+    boundary = "drive_upload_boundary_x7k2"
+    meta = json.dumps({"name": filename, "parents": [folder_id]}).encode()
+
+    body = (
+        f"--{boundary}\r\n"
+        f"Content-Type: application/json; charset=UTF-8\r\n\r\n"
+    ).encode() + meta + (
+        f"\r\n--{boundary}\r\n"
+        f"Content-Type: {mime_type}\r\n\r\n"
+    ).encode() + file_bytes + f"\r\n--{boundary}--".encode()
+
+    req = urllib.request.Request(
+        "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": f"multipart/related; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+            app.logger.info("Drive upload OK: %s → %s", filename, result.get("id"))
+            return result.get("id")
+    except urllib.error.HTTPError as e:
+        body_err = e.read().decode("utf-8", errors="replace")[:300]
+        app.logger.warning("Drive upload HTTP %s for %s: %s", e.code, filename, body_err)
+        return None
+    except Exception as exc:
+        app.logger.warning("Drive upload failed for %s: %s", filename, exc)
+        return None
+
+
 @app.get("/")
 def health_check():
     return jsonify({
@@ -3958,6 +4105,29 @@ def process_retail_file_json():
         )
         vat_enabled = "Yes" if str(request.form.get("vat_enabled", "true")).lower() in {"true", "yes", "1", "y"} else "No"
         track_stock_enabled = str(request.form.get("track_stock", "true")).lower() in {"true", "yes", "1", "y"}
+
+        # Read bytes once — used for both parsing and Drive upload
+        filename = uploaded_file.filename or "upload"
+        file_bytes = uploaded_file.read()
+        mime_type = uploaded_file.mimetype or "application/octet-stream"
+
+        # Upload to Google Drive in background — never blocks the response
+        if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
+            import threading
+            threading.Thread(
+                target=drive_upload_file,
+                args=(filename, file_bytes, mime_type),
+                daemon=True,
+            ).start()
+
+        # Wrap bytes back into a FileStorage for the parser
+        from werkzeug.datastructures import FileStorage
+        uploaded_file = FileStorage(
+            stream=io.BytesIO(file_bytes),
+            filename=filename,
+            content_type=mime_type,
+        )
+
         raw_products, layout_meta = parse_uploaded_file_ai_assisted(uploaded_file, parse_mode=parse_mode, gemini_api_key=gemini_api_key, user_instructions=user_instructions)
         raw_products, instruction_meta = apply_ai_instruction_postprocess(raw_products, user_instructions=user_instructions, vat_enabled=vat_enabled, track_stock_enabled=track_stock_enabled, gemini_api_key=gemini_api_key)
         payload = preflight_products_payload(raw_products, parse_mode=parse_mode)
