@@ -3984,24 +3984,36 @@ def _drive_get_access_token() -> Optional[str]:
     return token
 
 
-def drive_upload_file(filename: str, file_bytes: bytes, mime_type: str = "application/octet-stream") -> Optional[str]:
+def drive_upload_file(filename: str, file_bytes: bytes, mime_type: str = "application/octet-stream") -> Dict[str, Any]:
     """Upload a file to the Google Drive folder set in GOOGLE_DRIVE_FOLDER_ID.
 
-    Returns the Drive file ID on success, None on failure.
-    Runs silently — logs warnings but never raises, so it never breaks extraction.
+    Returns a structured result instead of only None. This lets the frontend and
+    dashboard show a clear warning when Drive is not configured, the API is
+    disabled, or the folder permissions are wrong.
     """
     import urllib.request
     import urllib.error
 
     folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "1ifWvjJ9c_r_H3B919qXSHaOwMuwMdEjK").strip()
     if not folder_id:
-        return None
+        return {
+            "ok": False,
+            "status": "skipped",
+            "file_id": None,
+            "file_url": None,
+            "error": "GOOGLE_DRIVE_FOLDER_ID is not set.",
+        }
 
     token = _drive_get_access_token()
     if not token:
-        return None
+        return {
+            "ok": False,
+            "status": "skipped",
+            "file_id": None,
+            "file_url": None,
+            "error": "Google Drive service account is not configured or could not mint an access token.",
+        }
 
-    # Multipart upload: metadata part + file part
     boundary = "drive_upload_boundary_x7k2"
     meta = json.dumps({"name": filename, "parents": [folder_id]}).encode()
 
@@ -4014,7 +4026,7 @@ def drive_upload_file(filename: str, file_bytes: bytes, mime_type: str = "applic
     ).encode() + file_bytes + f"\r\n--{boundary}--".encode()
 
     req = urllib.request.Request(
-        "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name",
+        "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink",
         data=body,
         headers={
             "Authorization": f"Bearer {token}",
@@ -4026,15 +4038,53 @@ def drive_upload_file(filename: str, file_bytes: bytes, mime_type: str = "applic
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             result = json.loads(resp.read())
-            app.logger.info("Drive upload OK: %s → %s", filename, result.get("id"))
-            return result.get("id")
+            file_id = result.get("id")
+            file_url = result.get("webViewLink") or (f"https://drive.google.com/file/d/{file_id}/view" if file_id else None)
+            app.logger.info("Drive upload OK: %s -> %s", filename, file_id)
+            return {
+                "ok": True,
+                "status": "uploaded",
+                "file_id": file_id,
+                "file_url": file_url,
+                "error": None,
+            }
     except urllib.error.HTTPError as e:
-        body_err = e.read().decode("utf-8", errors="replace")[:300]
-        app.logger.warning("Drive upload HTTP %s for %s: %s", e.code, filename, body_err)
-        return None
+        raw_body = e.read().decode("utf-8", errors="replace")
+        short_body = raw_body[:1000]
+        message = short_body
+        try:
+            parsed = json.loads(raw_body)
+            message = parsed.get("error", {}).get("message") or short_body
+        except Exception:
+            pass
+
+        project_match = re.search(r"project\s+(\d+)", message, flags=re.I)
+        project_number = project_match.group(1) if project_match else ""
+        help_url = (
+            f"https://console.developers.google.com/apis/api/drive.googleapis.com/overview?project={project_number}"
+            if project_number else
+            "https://console.developers.google.com/apis/api/drive.googleapis.com/overview"
+        )
+        app.logger.warning("Drive upload HTTP %s for %s: %s", e.code, filename, short_body)
+        return {
+            "ok": False,
+            "status": "failed",
+            "http_status": e.code,
+            "file_id": None,
+            "file_url": None,
+            "error": message,
+            "help_url": help_url if e.code == 403 else None,
+            "project_number": project_number or None,
+        }
     except Exception as exc:
         app.logger.warning("Drive upload failed for %s: %s", filename, exc)
-        return None
+        return {
+            "ok": False,
+            "status": "failed",
+            "file_id": None,
+            "file_url": None,
+            "error": str(exc),
+        }
 
 
 @app.get("/")
@@ -4106,19 +4156,20 @@ def process_retail_file_json():
         vat_enabled = "Yes" if str(request.form.get("vat_enabled", "true")).lower() in {"true", "yes", "1", "y"} else "No"
         track_stock_enabled = str(request.form.get("track_stock", "true")).lower() in {"true", "yes", "1", "y"}
 
-        # Read bytes once — used for both parsing and Drive upload
+        # Read bytes once. The same bytes are used for parsing and optional Drive backup.
         filename = uploaded_file.filename or "upload"
         file_bytes = uploaded_file.read()
         mime_type = uploaded_file.mimetype or "application/octet-stream"
 
-        # Upload to Google Drive in background — never blocks the response
+        drive_upload = {
+            "ok": False,
+            "status": "skipped",
+            "file_id": None,
+            "file_url": None,
+            "error": "Google Drive backup is not configured. Set GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_DRIVE_FOLDER_ID.",
+        }
         if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
-            import threading
-            threading.Thread(
-                target=drive_upload_file,
-                args=(filename, file_bytes, mime_type),
-                daemon=True,
-            ).start()
+            drive_upload = drive_upload_file(filename, file_bytes, mime_type)
 
         # Wrap bytes back into a FileStorage for the parser
         from werkzeug.datastructures import FileStorage
@@ -4140,10 +4191,18 @@ def process_retail_file_json():
             "errors": sum(1 for i in issues if i["level"] == "error"),
             "warnings": sum(1 for i in issues if i["level"] == "warning"),
         })
-        # Return a compact payload by default. This prevents large cross-origin
-        # POST responses from being reported by browsers as opaque
-        # `TypeError: Failed to fetch` errors.
-        return jsonify({
+        summary["drive_upload"] = drive_upload
+
+        response_payload = {
+            "success": True,
+            "phase": "processed",
+            "extraction_success": True,
+            "drive_upload_ok": bool(drive_upload.get("ok")),
+            "drive_upload_status": drive_upload.get("status"),
+            "drive_file_id": drive_upload.get("file_id"),
+            "drive_file_url": drive_upload.get("file_url"),
+            "drive_upload_error": drive_upload.get("error"),
+            "drive_upload_help_url": drive_upload.get("help_url"),
             "products": [compact_product_for_frontend(row) for row in products],
             "price_conflicts": [
                 compact_conflict_for_frontend(conflict)
@@ -4151,7 +4210,17 @@ def process_retail_file_json():
             ],
             "issues": issues,
             "summary": summary,
-        })
+        }
+
+        # Keep extraction usable even if Drive fails, but allow strict deployments
+        # to fail the request by setting DRIVE_UPLOAD_REQUIRED=true.
+        if os.environ.get("DRIVE_UPLOAD_REQUIRED", "false").lower() in {"true", "yes", "1", "y"} and not drive_upload.get("ok"):
+            response_payload["success"] = False
+            response_payload["phase"] = "drive_upload"
+            response_payload["message"] = "Extraction completed, but Google Drive backup failed."
+            return cors_json(response_payload, 502)
+
+        return cors_json(response_payload)
     except Exception as exc:
         import traceback
         app.logger.exception("process-retail-file-json failed")
