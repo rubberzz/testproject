@@ -1429,12 +1429,27 @@ def variant_candidates_from_title(title: str) -> List[Tuple[str, str, str, str]]
         return []
     candidates: List[Tuple[str, str, str, str]] = []
 
-    dash = re.match(r"^(.{3,}?)\s+-\s+(.{1,40})$", title)
-    if dash:
-        base = dash.group(1).strip()
-        value = dash.group(2).strip()
-        if base and value and not parse_money(value):
-            candidates.append((base, "Option", value, "dash"))
+    # ── Middle-dot separator (·) — pre-exploded Shopify/WooCommerce rows ──────
+    # Pattern: "Product Name - Colour · Size / Number"
+    # e.g. "Men's Bush Shirt: Long-Sleeve (Tech) - olive · S / 36"
+    # Split on the LAST · to extract the variant value after it.
+    if "\u00b7" in title:
+        dot_idx = title.rfind("\u00b7")
+        base = title[:dot_idx].strip(" -·•,/\\")
+        value = title[dot_idx + 1:].strip()
+        if base and value and len(base) >= 3:
+            # Normalise "S / 36" → "S / 36" (keep as-is, it's a meaningful label)
+            candidates.append((base, "Variant", value, "middle-dot"))
+
+    # ── Dash separator ────────────────────────────────────────────────────────
+    # Skip if we already have a middle-dot candidate — the dot is more explicit.
+    if "\u00b7" not in title:
+        dash = re.match(r"^(.{3,}?)\s+-\s+(.{1,40})$", title)
+        if dash:
+            base = dash.group(1).strip()
+            value = dash.group(2).strip()
+            if base and value and not parse_money(value):
+                candidates.append((base, "Option", value, "dash"))
 
     clothing = re.search(r"\b(XXXL|XXL|XL|XS|S|M|L|Small|Medium|Large|Extra Large)\b$", title, flags=re.I)
     if clothing:
@@ -1492,7 +1507,7 @@ def infer_variants_from_titles(products: List[Dict[str, Any]]) -> List[Dict[str,
             candidate_groups.setdefault(key, []).append((row, attr_value, base, kind))
 
     valid_groups: List[Tuple[int, int, Tuple[str, str, str], List[Tuple[Dict[str, Any], str, str, str]]]] = []
-    kind_priority = {"dash": 0, "flavour": 1, "clothing-size": 2, "size": 3}
+    kind_priority = {"middle-dot": 0, "dash": 1, "flavour": 2, "clothing-size": 3, "size": 4}
     for key, rows in candidate_groups.items():
         if len(rows) <= 1:
             continue
