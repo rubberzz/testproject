@@ -72,6 +72,8 @@ def compact_product_for_frontend(row: Dict[str, Any]) -> Dict[str, Any]:
         "attr3_name",
         "attr3_val",
         "image_url",
+        "vat_enabled",
+        "track_stock",
         "source_sheet",
         "source_row",
         "unique_id",
@@ -3024,7 +3026,7 @@ def index_to_excel_col(idx: int) -> str:
     return letters
 
 
-def ai_layout_prompt(sample: Dict[str, Any]) -> str:
+def ai_layout_prompt(sample: Dict[str, Any], user_instructions: str = "") -> str:
     return (
         "You are a retail spreadsheet layout planner for a Yoco POS import tool. "
         "You DO NOT extract all products. You only inspect the sampled rows and return a JSON extraction plan that Python can apply to the full workbook.\n\n"
@@ -3050,11 +3052,13 @@ def ai_layout_prompt(sample: Dict[str, Any]) -> str:
         "- Identify selling/retail/customer price, not cost/wholesale, unless wholesale is clearly the only customer price.\n"
         "- Product names containing x 6, x12, x 24, case, pack, pcs or units are case/pack rows. Do not mark them as normal variants; Python will flag them for user confirmation.\n"
         "- If confidence is below 0.70, return layout_type unknown and explain why.\n\n"
-        "Workbook sample:\n" + json.dumps(safe_jsonable(sample), ensure_ascii=False)
+        "User/operator instructions to respect when choosing columns or category rules:\n"
+        + (normalise_text(user_instructions) or "None")
+        + "\n\nWorkbook sample:\n" + json.dumps(safe_jsonable(sample), ensure_ascii=False)
     )
 
 
-def call_gemini_layout_planner(sample: Dict[str, Any], api_key_override: str = "") -> Optional[Dict[str, Any]]:
+def call_gemini_layout_planner(sample: Dict[str, Any], api_key_override: str = "", user_instructions: str = "") -> Optional[Dict[str, Any]]:
     """Call Gemini if GEMINI_API_KEY is configured. Otherwise return None.
 
     The AI only returns a workbook layout plan. It does not extract products.
@@ -3077,7 +3081,7 @@ def call_gemini_layout_planner(sample: Dict[str, Any], api_key_override: str = "
         return None
 
     model = os.environ.get("GEMINI_LAYOUT_MODEL", "gemini-2.5-flash-preview-09-2025").strip() or "gemini-2.5-flash-preview-09-2025"
-    cache_key = hashlib.sha256(json.dumps(safe_jsonable(sample), sort_keys=True).encode("utf-8")).hexdigest()
+    cache_key = hashlib.sha256(json.dumps({"sample": safe_jsonable(sample), "user_instructions": normalise_text(user_instructions)}, sort_keys=True).encode("utf-8")).hexdigest()
     if cache_key in _AI_LAYOUT_CACHE:
         return _AI_LAYOUT_CACHE[cache_key]
 
@@ -3087,7 +3091,7 @@ def call_gemini_layout_planner(sample: Dict[str, Any], api_key_override: str = "
 
     prompt = (
         "Return only strict JSON. No markdown, no prose.\n\n"
-        + ai_layout_prompt(sample)
+        + ai_layout_prompt(sample, user_instructions=user_instructions)
     )
 
     payload = {
@@ -3304,7 +3308,132 @@ def parse_known_structured_export_from_bytes(raw_bytes: bytes, ext: str) -> Tupl
         "ai_rows": 0,
     }
 
-def parse_uploaded_file_ai_assisted(file_storage, parse_mode: str = "variant", gemini_api_key: str = "") -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+
+
+_CATEGORY_KEYWORDS = [
+    ("Cleaning", ["clean", "detergent", "soap", "bleach", "mop", "broom", "dishwash", "laundry", "sanit", "polish"]),
+    ("Beverages", ["juice", "drink", "cooldrink", "soda", "water", "cola", "tonic", "energy"]),
+    ("Beer", ["beer", "lager", "pilsner", "draught", "stout", "castle", "heineken", "carling"]),
+    ("Wine", ["wine", "merlot", "chardonnay", "sauvignon", "cabernet", "rose", "pinot"]),
+    ("Spirits", ["whisky", "whiskey", "vodka", "gin", "rum", "brandy", "tequila", "liqueur"]),
+    ("Snacks", ["chips", "crisps", "sweets", "chocolate", "biscuit", "cracker", "popcorn"]),
+    ("Bakery", ["bread", "roll", "bun", "cake", "muffin", "pastry"]),
+    ("Dairy", ["milk", "cheese", "yoghurt", "yogurt", "butter", "cream"]),
+    ("Clothing & Apparel", ["shirt", "pants", "trouser", "jacket", "shorts", "dress", "shoe", "cap", "sock"]),
+    ("Hardware", ["bolt", "screw", "nail", "paint", "cement", "pipe", "cable", "wire", "tool"]),
+]
+
+
+def infer_category_from_title_for_instructions(row: Dict[str, Any]) -> str:
+    text = normalise_for_compare(" ".join([
+        title_value(row),
+        normalise_text(row.get("description") or row.get("Description")),
+        normalise_text(row.get("brand") or row.get("Brand")),
+    ]))
+    if not text:
+        return ""
+    for category, words in _CATEGORY_KEYWORDS:
+        if any(word in text for word in words):
+            return category
+    return ""
+
+
+def _instruction_exclusion_terms(user_instructions: str) -> List[str]:
+    """Extract simple ignore/exclude/remove terms from operator instructions.
+
+    Examples supported:
+      - ignore cleaning products
+      - exclude tobacco and vapes
+      - skip category: Hardware
+    """
+    text = normalise_text(user_instructions).lower()
+    if not text:
+        return []
+    terms: List[str] = []
+    for match in re.finditer(r"\b(?:ignore|exclude|remove|skip|do not include|dont include|don't include)\b\s*[:\-]?\s*([^\.\n;]+)", text, flags=re.I):
+        phrase = match.group(1).strip()
+        phrase = re.sub(r"\b(products?|items?|category|categories|rows?|please|from the file|from export)\b", " ", phrase, flags=re.I)
+        for part in re.split(r",|/|\band\b|\bor\b", phrase):
+            term = normalise_for_compare(part)
+            if term and len(term) >= 3 and term not in {"all", "the", "any"}:
+                terms.append(term)
+    # Preserve order and uniqueness.
+    out: List[str] = []
+    seen = set()
+    for term in terms:
+        if term not in seen:
+            seen.add(term)
+            out.append(term)
+    return out
+
+
+def apply_ai_instruction_postprocess(products: List[Dict[str, Any]], user_instructions: str = "", vat_enabled: str = "Yes", track_stock_enabled: bool = True) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Apply the dashboard AI-instruction controls to deterministic Python rows.
+
+    The visual AI instruction box already affects image/PDF Gemini extraction through
+    buildPrompt(). Spreadsheet uploads use this backend, so the same instructions need
+    to be applied here too.
+    """
+    instructions = normalise_text(user_instructions)
+    exclusions = _instruction_exclusion_terms(instructions)
+    out: List[Dict[str, Any]] = []
+    removed = 0
+    categories_inferred = 0
+    cleaned_names = 0
+    barcode_filled = 0
+    stock_filled = 0
+
+    for original in products:
+        row = dict(original)
+        haystack = normalise_for_compare(" ".join([
+            title_value(row),
+            normalise_text(row.get("category") or row.get("Category")),
+            normalise_text(row.get("description") or row.get("Description")),
+            normalise_text(row.get("brand") or row.get("Brand")),
+        ]))
+        if exclusions and any(term in haystack for term in exclusions):
+            removed += 1
+            continue
+
+        cleaned_title = clean_product_title(title_value(row))
+        if cleaned_title and cleaned_title != title_value(row):
+            set_title(row, cleaned_title)
+            cleaned_names += 1
+
+        category = normalise_text(row.get("category") or row.get("Category"))
+        if not category or category.lower() == "uncategorised":
+            inferred = infer_category_from_title_for_instructions(row)
+            if inferred:
+                row["category"] = row["Category"] = inferred
+                categories_inferred += 1
+
+        code = best_code(row)
+        if code:
+            if not clean_code(row.get("barcode") or row.get("Barcode")):
+                row["barcode"] = row["Barcode"] = code
+                barcode_filled += 1
+            if not clean_code(row.get("sku") or row.get("SKU")):
+                row["sku"] = row["SKU"] = code
+
+        row["vat_enabled"] = "Yes" if str(vat_enabled).lower() in {"yes", "true", "1", "y"} else "No"
+        row["VAT Enabled"] = row["vat_enabled"]
+
+        if not normalise_text(row.get("track_stock") or row.get("Track Stock")):
+            row["track_stock"] = row["Track Stock"] = ("Variant" if row_is_variant(row) else "Product") if track_stock_enabled else "No"
+            stock_filled += 1
+        out.append(row)
+
+    return out, {
+        "ai_instruction_rows_removed": removed,
+        "ai_instruction_exclusion_terms": exclusions,
+        "ai_instruction_categories_inferred": categories_inferred,
+        "ai_instruction_names_cleaned": cleaned_names,
+        "ai_instruction_barcodes_filled": barcode_filled,
+        "ai_instruction_stock_filled": stock_filled,
+        "ai_instructions_applied": bool(instructions),
+    }
+
+def parse_uploaded_file_ai_assisted(file_storage, parse_mode: str = "variant", gemini_api_key: str = "", user_instructions: str = "") -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """New architecture entrypoint.
 
     1. Python samples workbook structure.
@@ -3324,7 +3453,7 @@ def parse_uploaded_file_ai_assisted(file_storage, parse_mode: str = "variant", g
         return structured_products, structured_meta
 
     sample = workbook_sample_from_bytes(raw_bytes, ext)
-    plan = call_gemini_layout_planner(sample, api_key_override=gemini_api_key)
+    plan = call_gemini_layout_planner(sample, api_key_override=gemini_api_key, user_instructions=user_instructions)
     ai_products: List[Dict[str, Any]] = []
     if plan:
         ai_products = extract_products_with_ai_plan(raw_bytes, ext, plan, parse_mode=parse_mode)
@@ -3444,7 +3573,7 @@ def product_to_yoco_row(row: Dict[str, Any], track_stock: str = "Product", vat_e
         "Default Quantity": default_quantity,
         "Quantity Units": normalise_text(row.get("quantity_units") or row.get("Quantity Units")),
         "Ask For Price": "No",
-        "VAT Enabled": vat_enabled,
+        "VAT Enabled": normalise_text(row.get("vat_enabled") or row.get("VAT Enabled")) or vat_enabled,
         "Variant Price": variant_price,
         "Variant Enabled": variant_enabled,
         "Attribute 1": normalise_text(row.get("attr1_name") or row.get("Attribute 1")),
@@ -3571,12 +3700,22 @@ def process_retail_file_json():
             or request.form.get("apiKey", "")
             or request.form.get("api_key", "")
         )
-        raw_products, layout_meta = parse_uploaded_file_ai_assisted(uploaded_file, parse_mode=parse_mode, gemini_api_key=gemini_api_key)
+        user_instructions = (
+            request.form.get("ai_instructions", "")
+            or request.form.get("user_instructions", "")
+            or request.form.get("instructions", "")
+            or request.form.get("ai_notes", "")
+        )
+        vat_enabled = "Yes" if str(request.form.get("vat_enabled", "true")).lower() in {"true", "yes", "1", "y"} else "No"
+        track_stock_enabled = str(request.form.get("track_stock", "true")).lower() in {"true", "yes", "1", "y"}
+        raw_products, layout_meta = parse_uploaded_file_ai_assisted(uploaded_file, parse_mode=parse_mode, gemini_api_key=gemini_api_key, user_instructions=user_instructions)
+        raw_products, instruction_meta = apply_ai_instruction_postprocess(raw_products, user_instructions=user_instructions, vat_enabled=vat_enabled, track_stock_enabled=track_stock_enabled)
         payload = preflight_products_payload(raw_products, parse_mode=parse_mode)
         products = payload["products"]
         issues = build_issues(products)
         summary = dict(payload.get("metadata") or {})
         summary.update(layout_meta or {})
+        summary.update(instruction_meta or {})
         summary.update({
             "errors": sum(1 for i in issues if i["level"] == "error"),
             "warnings": sum(1 for i in issues if i["level"] == "warning"),
@@ -3621,7 +3760,16 @@ def process_retail_file_xlsx():
             or request.form.get("apiKey", "")
             or request.form.get("api_key", "")
         )
-        raw_products, layout_meta = parse_uploaded_file_ai_assisted(uploaded_file, parse_mode=parse_mode, gemini_api_key=gemini_api_key)
+        user_instructions = (
+            request.form.get("ai_instructions", "")
+            or request.form.get("user_instructions", "")
+            or request.form.get("instructions", "")
+            or request.form.get("ai_notes", "")
+        )
+        vat_enabled = "Yes" if str(request.form.get("vat_enabled", "true")).lower() in {"true", "yes", "1", "y"} else "No"
+        track_stock_enabled = str(request.form.get("track_stock", "true")).lower() in {"true", "yes", "1", "y"}
+        raw_products, layout_meta = parse_uploaded_file_ai_assisted(uploaded_file, parse_mode=parse_mode, gemini_api_key=gemini_api_key, user_instructions=user_instructions)
+        raw_products, _instruction_meta = apply_ai_instruction_postprocess(raw_products, user_instructions=user_instructions, vat_enabled=vat_enabled, track_stock_enabled=track_stock_enabled)
         raw_products = apply_parse_mode(raw_products, parse_mode)
         products = preflight_products_for_frontend(raw_products)
         normalise_sparse_variant_matrices_for_yoco(products)
