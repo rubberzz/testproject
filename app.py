@@ -284,6 +284,132 @@ def normalise_for_compare(value: Any) -> str:
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
+def clean_product_title(value: Any) -> str:
+    """Clean product/category text at extraction time.
+
+    This keeps source wording intact, but fixes recurring OCR/AI artefacts before
+    rows reach variant inference or the frontend table.
+    """
+    text = normalise_text(value)
+    if not text:
+        return ""
+    text = text.replace("×", "x")
+    # Common Gemini/OCR error in liquor lists: "@&" or "@ &" should be "&".
+    text = re.sub(r"@\s*&", "&", text)
+    text = re.sub(r"&\s*&", "&", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    # Cosmetic spacing around punctuation.
+    text = re.sub(r"\s+([,.;:])", r"\1", text)
+    text = re.sub(r"\s*([&/])\s*", r" \1 ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+# Values that are often product descriptors/brand text, not true variants, when
+# an AI/parser has produced rows like Product="Black 750ml", Value="Label".
+# Those should become standalone names such as "Black Label 750ml".
+_NOT_SAFE_AS_IMPLIED_VARIANT = {
+    "label", "black label", "double malt", "lager", "lite", "milk stout", "stout",
+    "scotch", "scotch whisky", "white scotch whisky", "whisky", "gin", "vodka", "rum",
+    "crown", "extra", "pilsner", "draught", "draft", "premium", "original",
+}
+_SAFE_IMPLIED_VARIANT_WORDS = {
+    "apple", "manic mango", "mango", "ruby", "ruby apple", "blackberry", "watermelon",
+    "cranberry", "peach", "strawberry", "hawaiian", "hawian", "margarita", "pina colada",
+    "tropical", "orange", "lemon", "pressed lemon", "berry", "red berries", "wild berry",
+    "dry", "gold", "spin", "storm", "citrus", "classic", "blush", "mimosa", "cola",
+    "tonic", "pink tonic", "pink & tonic", "guarana",
+}
+
+
+def _is_suspicious_embedded_descriptor(value: Any) -> bool:
+    v = clean_product_title(value).lower()
+    v_norm = normalise_for_compare(v)
+    if not v_norm:
+        return False
+    if v_norm in {normalise_for_compare(x) for x in _SAFE_IMPLIED_VARIANT_WORDS}:
+        return False
+    if v_norm in {normalise_for_compare(x) for x in _NOT_SAFE_AS_IMPLIED_VARIANT}:
+        return True
+    # Product descriptors with liquor/category terms should stay in the name.
+    if re.search(r"\b(label|malt|lager|lite|stout|whisky|whiskey|scotch|vodka|gin|rum|draught|draft|pilsner)\b", v, re.I):
+        return True
+    # Long phrases are usually not simple flavour/size variants.
+    return len(v.split()) >= 3
+
+
+def _insert_descriptor_before_trailing_size(base_name: str, descriptor: str) -> str:
+    base = clean_product_title(base_name)
+    desc = clean_product_title(descriptor)
+    if not base or not desc:
+        return clean_product_title(" ".join([base, desc]))
+    base = re.sub(r"\s*-\s*$", "", base).strip()
+    # Avoid duplicating if the descriptor is already present.
+    if normalise_for_compare(desc) in normalise_for_compare(base):
+        return base
+    size_match = re.search(r"\b\d+(?:[,.]\d+)?\s*(?:ml|l|lt|litre|liter|g|kg)\b\s*$", base, re.I)
+    if size_match:
+        prefix = base[:size_match.start()].strip()
+        size = size_match.group(0).strip()
+        return clean_product_title(f"{prefix} {desc} {size}")
+    return clean_product_title(f"{base} {desc}")
+
+
+def repair_muddled_extracted_variant_names(products: List[Dict[str, Any]]) -> int:
+    """Undo over-aggressive variant splitting from AI/original extraction.
+
+    Some supplier rows like "Black Label 750ml" were incorrectly returned as
+    product_name="Black 750ml", Value 1="Label". This converts only suspicious
+    descriptor variants back into standalone products while preserving real
+    dash/flavour variants such as "Brutal Fruit 620ml - apple".
+    """
+    changed = 0
+    for row in products:
+        if not row_is_variant(row):
+            # Still clean simple text artefacts.
+            cleaned = clean_product_title(title_value(row))
+            if cleaned and cleaned != title_value(row):
+                set_title(row, cleaned)
+                changed += 1
+            continue
+        attr_values = [
+            row.get("attr1_val") or row.get("Value 1"),
+            row.get("attr2_val") or row.get("Value 2"),
+            row.get("attr3_val") or row.get("Value 3"),
+        ]
+        values = [clean_product_title(v) for v in attr_values if clean_product_title(v)]
+        if not values:
+            continue
+        # Repair only one-axis suspicious descriptor rows. Multi-axis Shopify variants remain intact.
+        if len(values) == 1 and _is_suspicious_embedded_descriptor(values[0]):
+            new_title = _insert_descriptor_before_trailing_size(title_value(row), values[0])
+            if new_title:
+                set_title(row, new_title)
+                set_product_id(row, slugify(new_title or best_code(row)))
+            set_variant_fields(row, False)
+            clear_variant_attributes(row)
+            price = get_price(row)
+            if price > 0:
+                row["selling_price"] = price
+                row["calculated_price"] = price
+                row["variant_price"] = price
+            changed += 1
+        else:
+            cleaned_title = clean_product_title(title_value(row))
+            if cleaned_title and cleaned_title != title_value(row):
+                set_title(row, cleaned_title)
+                changed += 1
+            # Clean attribute values too, especially @& -> &.
+            for idx in range(1, 4):
+                key = f"attr{idx}_val"
+                ykey = f"Value {idx}"
+                val = row.get(key) or row.get(ykey)
+                cval = clean_product_title(val)
+                if cval and cval != normalise_text(val):
+                    row[key] = row[ykey] = cval
+                    changed += 1
+    return changed
+
 
 def slugify(value: Any) -> str:
     text = normalise_text(value).lower().replace("×", "x")
@@ -965,6 +1091,7 @@ def preflight_products_payload(products: List[Dict[str, Any]], parse_mode: Any =
     mode = normalise_parse_mode(parse_mode)
     before_count = len(products)
     products = apply_parse_mode(products, mode)
+    repaired_muddled_variant_names = repair_muddled_extracted_variant_names(products)
     cleaned = preflight_products_for_frontend(products)
     normalised_sparse_variant_groups = normalise_sparse_variant_matrices_for_yoco(cleaned)
     fixed_duplicate_skus = make_skus_unique_for_yoco(cleaned)
@@ -985,6 +1112,7 @@ def preflight_products_payload(products: List[Dict[str, Any]], parse_mode: Any =
             "flagged_case_packs": flagged_case_packs,
             "normalised_sparse_variant_groups": normalised_sparse_variant_groups,
             "fixed_duplicate_skus": fixed_duplicate_skus,
+            "repaired_muddled_variant_names": repaired_muddled_variant_names,
             "parse_mode": mode,
         },
     }
@@ -2507,8 +2635,8 @@ def title_with_replaced_size(title: str, new_size: str) -> str:
 
 
 def make_sectioned_product(title: str, category: str, price: float, source_sheet: str, ridx: int, code: str = "") -> Dict[str, Any]:
-    title = normalise_text(title)
-    category = normalise_text(category) or source_sheet or "Uncategorised"
+    title = clean_product_title(title)
+    category = clean_product_title(category) or source_sheet or "Uncategorised"
     code = clean_code(code)
     product_id = slugify(title or code or f"row-{ridx + 1}")
     row = {
