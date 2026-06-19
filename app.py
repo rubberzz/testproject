@@ -1432,18 +1432,40 @@ def variant_candidates_from_title(title: str) -> List[Tuple[str, str, str, str]]
     # ── Middle-dot separator (·) — pre-exploded Shopify/WooCommerce rows ──────
     # Pattern: "Product Name - Colour · Size / Number"
     # e.g. "Men's Bush Shirt: Long-Sleeve (Tech) - olive · S / 36"
-    # Split on the LAST · to extract the variant value after it.
     if "\u00b7" in title:
         dot_idx = title.rfind("\u00b7")
-        base = title[:dot_idx].strip(" -·•,/\\")
+        base = title[:dot_idx].strip(" -\u00b7\u2022,/\\")
         value = title[dot_idx + 1:].strip()
         if base and value and len(base) >= 3:
-            # Normalise "S / 36" → "S / 36" (keep as-is, it's a meaningful label)
             candidates.append((base, "Variant", value, "middle-dot"))
 
+    # ── Slash-separated variant suffix ────────────────────────────────────────
+    # Pattern: "Product Name colour / Size / Number"
+    # e.g. "Men's Bush Shirt: Long-Sleeve (Tech) olive / S / 36"
+    # Guard: skip dimension codes like "100x200 / CCA / SEA" and price-like values.
+    if " / " in title and "\u00b7" not in title:
+        parts = [p.strip() for p in title.split(" / ")]
+        # Only accept slash-separated variants when at least one segment is non-numeric.
+        # "S / 36", "XL / 48" are valid variant labels (size + collar).
+        # "R 52.00 / 36.00" should be rejected — all segments are pure money values.
+        def _is_pure_money(s: str) -> bool:
+            return bool(re.fullmatch(r"[Rr]?\s*[0-9][0-9,. ]*", s.strip()))
+        if len(parts) >= 3:
+            base = " / ".join(parts[:-2]).strip(" -\u00b7\u2022,/\\")
+            value_parts = parts[-2:]
+            value = " / ".join(value_parts).strip()
+            # Reject only if ALL value segments look like standalone prices
+            if base and value and len(base) >= 5 and not all(_is_pure_money(p) for p in value_parts):
+                candidates.append((base, "Variant", value, "slash"))
+        elif len(parts) == 2:
+            base = parts[0].strip(" -\u00b7\u2022,/\\")
+            value = parts[1].strip()
+            if base and value and len(base) >= 5 and not _is_pure_money(value):
+                candidates.append((base, "Variant", value, "slash"))
+
     # ── Dash separator ────────────────────────────────────────────────────────
-    # Skip if we already have a middle-dot candidate — the dot is more explicit.
-    if "\u00b7" not in title:
+    # Skip if middle-dot or slash already found — they are more explicit signals.
+    if "\u00b7" not in title and " / " not in title:
         dash = re.match(r"^(.{3,}?)\s+-\s+(.{1,40})$", title)
         if dash:
             base = dash.group(1).strip()
@@ -1507,7 +1529,7 @@ def infer_variants_from_titles(products: List[Dict[str, Any]]) -> List[Dict[str,
             candidate_groups.setdefault(key, []).append((row, attr_value, base, kind))
 
     valid_groups: List[Tuple[int, int, Tuple[str, str, str], List[Tuple[Dict[str, Any], str, str, str]]]] = []
-    kind_priority = {"middle-dot": 0, "dash": 1, "flavour": 2, "clothing-size": 3, "size": 4}
+    kind_priority = {"middle-dot": 0, "slash": 1, "dash": 2, "flavour": 3, "clothing-size": 4, "size": 5}
     for key, rows in candidate_groups.items():
         if len(rows) <= 1:
             continue
