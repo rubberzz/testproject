@@ -327,6 +327,11 @@ def _is_suspicious_embedded_descriptor(value: Any) -> bool:
     v_norm = normalise_for_compare(v)
     if not v_norm:
         return False
+    # Clothing/Shopify variant labels such as "S / 36" or "olive / XL / 48"
+    # are valid variants. Do not let the name-repair pass convert them back to
+    # single products.
+    if looks_like_clothing_size_combo(v):
+        return False
     if v_norm in {normalise_for_compare(x) for x in _SAFE_IMPLIED_VARIANT_WORDS}:
         return False
     if v_norm in {normalise_for_compare(x) for x in _NOT_SAFE_AS_IMPLIED_VARIANT}:
@@ -334,7 +339,8 @@ def _is_suspicious_embedded_descriptor(value: Any) -> bool:
     # Product descriptors with liquor/category terms should stay in the name.
     if re.search(r"\b(label|malt|lager|lite|stout|whisky|whiskey|scotch|vodka|gin|rum|draught|draft|pilsner)\b", v, re.I):
         return True
-    # Long phrases are usually not simple flavour/size variants.
+    # Long phrases are usually not simple flavour/size variants, unless they are
+    # recognised clothing size combinations above.
     return len(v.split()) >= 3
 
 
@@ -1375,31 +1381,6 @@ _FLAVOUR_PHRASES = {
 _SIZE_RE = re.compile(r"\b\d+(?:[,.]\d+)?\s*(?:ml|l|litre|liter|g|kg|mm|cm|m)\b", re.I)
 _TRAILING_SIZE_RE = re.compile(r"\b\d+(?:[,.]\d+)?\s*(?:ml|l|litre|liter|g|kg|mm|cm|m)\s*$", re.I)
 
-# Common Shopify/pre-exploded clothing colour suffixes. Used only when a generic
-# parser gives names like "Shirt olive / S / 36"; it lets variant mode regroup as
-# product "Shirt" with variant "olive / S / 36".
-_COMMON_COLOUR_SUFFIXES = {
-    "black", "white", "grey", "gray", "charcoal", "navy", "blue", "royal blue",
-    "red", "maroon", "burgundy", "green", "olive", "khaki", "stone", "sand",
-    "tan", "brown", "beige", "natural", "cream", "orange", "yellow", "pink",
-    "purple", "camo", "camouflage", "denim", "light blue", "dark blue",
-}
-
-def split_trailing_colour_from_base(base: str) -> Tuple[str, str]:
-    text = normalise_text(base).strip(" -·•,/\\")
-    if not text:
-        return "", ""
-    norm_text = normalise_for_compare(text)
-    for colour in sorted(_COMMON_COLOUR_SUFFIXES, key=len, reverse=True):
-        colour_norm = normalise_for_compare(colour)
-        if norm_text.endswith(" " + colour_norm):
-            cut = len(text) - len(colour)
-            candidate_base = text[:cut].strip(" -·•,/\\")
-            candidate_colour = text[cut:].strip(" -·•,/\\")
-            if len(candidate_base) >= 5:
-                return candidate_base, candidate_colour
-    return text, ""
-
 
 def clean_option_base(base: str) -> str:
     base = normalise_text(base)
@@ -1447,6 +1428,76 @@ def infer_flavour_variant_from_title(title: str) -> Optional[Tuple[str, str, str
     return None
 
 
+
+_COLOUR_PHRASES = {
+    "olive", "black", "white", "navy", "blue", "red", "green", "grey", "gray",
+    "charcoal", "stone", "khaki", "brown", "tan", "beige", "cream", "orange",
+    "yellow", "pink", "purple", "maroon", "burgundy", "natural", "sand",
+    "dark olive", "light olive", "dark grey", "light grey", "dark gray", "light gray",
+    "royal blue", "sky blue", "forest green", "bottle green", "off white",
+}
+
+_CLOTHING_SIZE_TOKEN_RE = re.compile(r"^(?:XS|S|M|L|XL|XXL|XXXL|2XL|3XL|4XL|5XL|Small|Medium|Large|Extra Large)$", re.I)
+_NUMERIC_SIZE_TOKEN_RE = re.compile(r"^\d+(?:[,.]\d+)?$", re.I)
+
+
+def looks_like_clothing_size_combo(value: Any) -> bool:
+    """True for variant labels such as S / 36, olive / XL / 48.
+
+    These are legitimate Shopify/clothing variant values and must never be
+    treated as suspicious product descriptors by the name-repair logic.
+    """
+    text = clean_product_title(value)
+    if not text or " / " not in text:
+        return False
+    parts = [p.strip() for p in text.split(" / ") if p.strip()]
+    if len(parts) < 2:
+        return False
+    has_size = any(_CLOTHING_SIZE_TOKEN_RE.match(p) for p in parts)
+    has_numeric = any(_NUMERIC_SIZE_TOKEN_RE.match(p) for p in parts)
+    return has_size and has_numeric
+
+
+def split_flattened_shopify_variant_prefix(first_part: str, value_parts: List[str]) -> Tuple[str, str]:
+    """Split flattened Shopify titles into product base and combined variant.
+
+    Some extracts arrive as a single product name rather than Shopify option
+    columns, for example:
+      Men's Bush Shirt: Long-Sleeve (Tech) olive / S / 36
+
+    The old slash parser used the first part as the base, producing:
+      Product: Men's Bush Shirt... olive
+      Variant: S / 36
+
+    This helper recognises clothing size patterns and moves the trailing colour
+    into the variant value:
+      Product: Men's Bush Shirt: Long-Sleeve (Tech)
+      Variant: olive / S / 36
+    """
+    base_part = clean_product_title(first_part)
+    clean_values = [clean_product_title(v) for v in value_parts if clean_product_title(v)]
+    if len(clean_values) >= 2 and _CLOTHING_SIZE_TOKEN_RE.match(clean_values[0]) and _NUMERIC_SIZE_TOKEN_RE.match(clean_values[1]):
+        base_norm = normalise_for_compare(base_part)
+        for colour in sorted(_COLOUR_PHRASES, key=len, reverse=True):
+            colour_norm = normalise_for_compare(colour)
+            if base_norm.endswith(" " + colour_norm):
+                # Remove the matched trailing colour from the display base.
+                m = re.search(r"\s+" + re.escape(colour) + r"\s*$", base_part, flags=re.I)
+                if m:
+                    base = base_part[:m.start()].strip(" -·•,/\\")
+                    value = " / ".join([base_part[m.start():].strip(), *clean_values])
+                    if base and value:
+                        return clean_product_title(base), clean_product_title(value)
+        # Fallback for lower-case colour-like final words, but avoid cutting a
+        # product word after a closing bracket/title case phrase.
+        m = re.match(r"^(.+?)\s+([a-z][a-z -]{2,30})$", base_part)
+        if m:
+            base = m.group(1).strip(" -·•,/\\")
+            colour = m.group(2).strip()
+            if base and colour and not colour.endswith(")"):
+                return clean_product_title(base), clean_product_title(" / ".join([colour, *clean_values]))
+    return base_part, " / ".join(clean_values)
+
 def variant_candidates_from_title(title: str) -> List[Tuple[str, str, str, str]]:
     """Return possible variant parses as (base, attribute, value, kind)."""
     title = normalise_text(title)
@@ -1476,18 +1527,16 @@ def variant_candidates_from_title(title: str) -> List[Tuple[str, str, str, str]]
         def _is_pure_money(s: str) -> bool:
             return bool(re.fullmatch(r"[Rr]?\s*[0-9][0-9,. ]*", s.strip()))
         if len(parts) >= 3:
-            base = " / ".join(parts[:-2]).strip(" -\u00b7\u2022,/\\")
+            # Default slash logic: last two parts are the explicit variant suffix.
+            # Special Shopify/clothing fallback: if the suffix is Size / Number
+            # and the first part ends in a colour, move that colour into the
+            # variant value so rows group under the real product name.
             value_parts = parts[-2:]
-            value = " / ".join(value_parts).strip()
-            # Generic parser fallback for Shopify-like names:
-            # "Men's Shirt olive / S / 36" -> base "Men's Shirt", value "olive / S / 36".
-            base_without_colour, colour = split_trailing_colour_from_base(base)
-            if colour:
-                base = base_without_colour
-                value = f"{colour} / {value}".strip(" /-")
+            base_seed = " / ".join(parts[:-2]).strip(" -\u00b7\u2022,/\\")
+            base, value = split_flattened_shopify_variant_prefix(base_seed, value_parts)
             # Reject only if ALL value segments look like standalone prices
             if base and value and len(base) >= 5 and not all(_is_pure_money(p) for p in value_parts):
-                candidates.append((base, "Variant", value, "slash"))
+                candidates.append((base, "Variant", value, "shopify-slash" if looks_like_clothing_size_combo(value) else "slash"))
         elif len(parts) == 2:
             base = parts[0].strip(" -\u00b7\u2022,/\\")
             value = parts[1].strip()
@@ -1560,7 +1609,7 @@ def infer_variants_from_titles(products: List[Dict[str, Any]]) -> List[Dict[str,
             candidate_groups.setdefault(key, []).append((row, attr_value, base, kind))
 
     valid_groups: List[Tuple[int, int, Tuple[str, str, str], List[Tuple[Dict[str, Any], str, str, str]]]] = []
-    kind_priority = {"middle-dot": 0, "slash": 1, "dash": 2, "flavour": 3, "clothing-size": 4, "size": 5}
+    kind_priority = {"middle-dot": 0, "shopify-slash": 0, "slash": 1, "dash": 2, "flavour": 3, "clothing-size": 4, "size": 5}
     for key, rows in candidate_groups.items():
         if len(rows) <= 1:
             continue
@@ -1851,27 +1900,24 @@ def is_shopify_export_sheet(raw_df: pd.DataFrame) -> bool:
     like Handle, Title, Option1 Name, Option1 Value, Variant SKU and Variant Price.
     They need a dedicated parser because product-level fields are only populated
     on the first row of each handle and should be forward-filled within the handle.
-
-    Be intentionally generous here: some Shopify XLSM files have regional price
-    columns such as "Price / South Africa" instead of exactly "Variant Price",
-    and some exports omit barcode/SKU. If we miss Shopify here, the generic/AI
-    parser flattens rows into names like "Product olive / S / 36" and they show
-    as Singles.
     """
-    return find_shopify_header_row(raw_df) is not None
+    if raw_df.empty:
+        return False
+    for ridx in range(min(len(raw_df), 8)):
+        headers = [normalise_header(v) for v in raw_df.iloc[ridx].tolist()]
+        header_set = set(h for h in headers if h)
+        required = {"handle", "title", "variant price"}
+        optionish = any(h.startswith("option1") for h in header_set)
+        skuish = "variant sku" in header_set or "variant barcode" in header_set
+        if required.issubset(header_set) and optionish and skuish:
+            return True
+    return False
 
 
 def find_shopify_header_row(raw_df: pd.DataFrame) -> Optional[int]:
-    for ridx in range(min(len(raw_df), 20)):
+    for ridx in range(min(len(raw_df), 12)):
         headers = [normalise_header(v) for v in raw_df.iloc[ridx].tolist()]
         header_set = set(h for h in headers if h)
-        has_handle_title = {"handle", "title"}.issubset(header_set)
-        has_option_values = any(h in header_set for h in {"option1 value", "option 1 value", "option2 value", "option 2 value"})
-        has_option_names = any(h in header_set for h in {"option1 name", "option 1 name", "option2 name", "option 2 name"})
-        has_variant_column = any(h.startswith("variant ") for h in header_set)
-        has_price_column = any((h == "variant price" or h.startswith("price") or "price /" in h) and "compare" not in h for h in header_set)
-        if has_handle_title and has_option_values and (has_option_names or has_variant_column or has_price_column):
-            return ridx
         if {"handle", "title", "variant price"}.issubset(header_set):
             return ridx
     return None
@@ -3173,52 +3219,6 @@ def extract_products_with_ai_plan(raw_bytes: bytes, ext: str, plan: Dict[str, An
     return products
 
 
-def parse_structured_ecommerce_workbook_direct(raw_bytes: bytes, ext: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Parse known structured exports before Gemini/generic parsing.
-
-    Shopify/Yoco files already carry trustworthy variant columns. They should not
-    go through the AI layout planner first, because a generic plan can flatten
-    variants into product-name text and produce Single rows.
-    """
-    if ext not in {"xlsx", "xls", "xlsm", "xl", "csv"}:
-        return [], {"structured_direct": False}
-    try:
-        if ext == "csv":
-            sheets = {"CSV": pd.read_csv(io.BytesIO(raw_bytes), dtype=object, header=None)}
-        else:
-            engine = "openpyxl" if ext in {"xlsx", "xlsm"} else None
-            sheets = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=None, dtype=object, header=None, engine=engine)
-    except Exception as exc:
-        app.logger.warning("Structured direct parse failed to open workbook: %s", exc)
-        return [], {"structured_direct": False, "structured_direct_error": str(exc)}
-
-    products: List[Dict[str, Any]] = []
-    sheet_kinds: List[str] = []
-    for sheet_name, raw_df in sheets.items():
-        source_sheet = str(sheet_name)
-        if is_yoco_products_export_sheet(raw_df):
-            rows = parse_yoco_products_export_sheet(raw_df, source_sheet)
-            if rows:
-                products.extend(rows)
-                sheet_kinds.append(f"{source_sheet}:yoco")
-            continue
-        if is_shopify_export_sheet(raw_df):
-            rows = parse_shopify_export_sheet(raw_df, source_sheet)
-            if rows:
-                products.extend(rows)
-                sheet_kinds.append(f"{source_sheet}:shopify")
-            continue
-
-    if not products:
-        return [], {"structured_direct": False}
-    return products, {
-        "structured_direct": True,
-        "layout_strategy": "structured_ecommerce_direct",
-        "structured_sheet_kinds": sheet_kinds,
-        "structured_rows": len(products),
-    }
-
-
 def parse_uploaded_file_ai_assisted(file_storage, parse_mode: str = "variant", gemini_api_key: str = "") -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """New architecture entrypoint.
 
@@ -3230,13 +3230,6 @@ def parse_uploaded_file_ai_assisted(file_storage, parse_mode: str = "variant", g
     filename = file_storage.filename or "upload"
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     raw_bytes = file_storage.read()
-
-    # Structured ecommerce exports must bypass the AI planner/generic parser.
-    # Their variant columns are explicit and more reliable than inferred layout.
-    structured_products, structured_meta = parse_structured_ecommerce_workbook_direct(raw_bytes, ext)
-    if structured_products:
-        return structured_products, structured_meta
-
     sample = workbook_sample_from_bytes(raw_bytes, ext)
     plan = call_gemini_layout_planner(sample, api_key_override=gemini_api_key)
     ai_products: List[Dict[str, Any]] = []
