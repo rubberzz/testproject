@@ -3421,40 +3421,226 @@ def _instruction_exclusion_terms(user_instructions: str) -> List[str]:
     return out
 
 
-def apply_ai_instruction_postprocess(products: List[Dict[str, Any]], user_instructions: str = "", vat_enabled: str = "Yes", track_stock_enabled: bool = True, gemini_api_key: str = "") -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Apply the dashboard AI-instruction controls to deterministic Python rows.
-
-    The HTML chat window calls Gemini Canvas AI to interpret the user's raw instructions
-    into precise directives before storing them. By the time instructions reach this
-    function (via the user_instructions form field), they are already AI-clarified.
-    This function applies those clarified directives to spreadsheet-extracted rows.
+def _apply_instructions_via_gemini(
+    products, user_instructions, gemini_api_key
+):
+    """Call Gemini to apply natural-language instructions to product rows.
+    Returns (updated_products, meta_dict).
     """
-    raw_instructions = (user_instructions or "").strip()
-    if not raw_instructions:
-        return products, {
-            "ai_instruction_rows_removed": 0,
-            "ai_instruction_exclusion_terms": [],
-            "ai_instruction_categories_inferred": 0,
-            "ai_instruction_categories_renamed": 0,
-            "ai_instruction_names_cleaned": 0,
-            "ai_instruction_barcodes_filled": 0,
-            "ai_instruction_stock_filled": 0,
-            "ai_instructions_applied": False,
-        }
+    import urllib.request
+    import urllib.parse
+    import urllib.error
 
-    instructions = normalise_text(raw_instructions)
-    exclusions = _instruction_exclusion_terms(instructions)
-    rename_rules = _instruction_rename_rules(user_instructions)
-    out: List[Dict[str, Any]] = []
-    removed = 0
-    categories_inferred = 0
-    categories_renamed = 0
-    cleaned_names = 0
+    api_key = (
+        str(gemini_api_key or "").strip()
+        or os.environ.get("GEMINI_API_KEY", "").strip()
+        or os.environ.get("GOOGLE_API_KEY", "").strip()
+        or os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY", "").strip()
+        or os.environ.get("API_KEY", "").strip()
+    )
+    if not api_key:
+        return products, {"ai_instructions_applied": False, "error": "no_api_key"}
+
+    compact = []
+    for r in products:
+        uid = r.get("_uid") or r.get("unique_id") or ""
+        compact.append({
+            "_uid": uid,
+            "product_name": normalise_text(r.get("product_name") or r.get("Product Name") or ""),
+            "category": normalise_text(r.get("category") or r.get("Category") or ""),
+            "selling_price": r.get("selling_price") or r.get("calculated_price") or 0,
+            "cost_price": r.get("cost_price") or r.get("default_cost_price") or 0,
+            "barcode": normalise_text(r.get("barcode") or r.get("Barcode") or ""),
+            "sku": normalise_text(r.get("sku") or r.get("SKU") or ""),
+            "brand": normalise_text(r.get("brand") or r.get("Brand") or ""),
+            "description": normalise_text(r.get("description") or r.get("Description") or ""),
+            "vat_enabled": r.get("vat_enabled") or "",
+            "track_stock": r.get("track_stock") or "",
+        })
+
+    system_prompt = (
+        "You are a retail data editor. You receive a list of products and a natural-language instruction.\n"
+        "Apply the instruction and return exactly what changed.\n\n"
+        "FIELDS you can change: product_name, category, selling_price, cost_price, barcode, sku, brand, description, vat_enabled, track_stock\n\n"
+        "RULES:\n"
+        "- Match product_name and category case-insensitively\n"
+        "- Partial match is fine: Amstel matches Amstel Lager, Amstel Light 330ml\n"
+        "- For specific product renames, only change that product\n"
+        "- For all [X], change every matching row\n"
+        "- For removals, set field=__remove and new=true\n"
+        "- For price adjustments like add 10%, compute the new numeric value per row\n\n"
+        'Return ONLY valid JSON, no markdown:\n'
+        '{"summary":"One sentence: what changed and how many rows.",'
+        '"changes":[{"uid":"_uid value","field":"field_name","new":"new value"}]}\n'
+        'If nothing matches: {"summary":"No matching products found.","changes":[]}'
+    )
+
+    user_msg = "PRODUCTS:\n" + json.dumps(compact, ensure_ascii=False) + "\n\nINSTRUCTION: " + user_instructions
+
+    model = os.environ.get("GEMINI_LAYOUT_MODEL", "gemini-2.5-flash-preview-09-2025").strip() or "gemini-2.5-flash-preview-09-2025"
+    encoded_key = urllib.parse.quote(api_key, safe="")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={encoded_key}"
+
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": system_prompt + "\n\n" + user_msg}]}],
+        "generationConfig": {"temperature": 0},
+    }
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        app.logger.warning("Gemini instruction apply failed: %s", exc)
+        return products, {"ai_instructions_applied": False, "error": str(exc)}
+
+    raw = ""
+    try:
+        raw = body["candidates"][0]["content"]["parts"][0]["text"].strip()
+        clean = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+        clean = re.sub(r"\s*```\s*$", "", clean, flags=re.MULTILINE).strip()
+        result = json.loads(clean)
+    except Exception as exc:
+        app.logger.warning("Gemini instruction response parse failed: %s raw: %s", exc, raw[:300])
+        return products, {"ai_instructions_applied": False, "error": "parse_failed"}
+
+    changes = result.get("changes") or []
+    summary = result.get("summary") or "Instructions applied."
+
+    uid_map = {}
+    for idx, r in enumerate(products):
+        uid = r.get("_uid") or r.get("unique_id") or ""
+        if uid:
+            uid_map[uid] = idx
+
+    field_aliases = {
+        "product_name":  ["product_name", "Product Name"],
+        "category":      ["category", "Category"],
+        "selling_price": ["selling_price", "calculated_price", "default_price"],
+        "cost_price":    ["cost_price", "default_cost_price"],
+        "barcode":       ["barcode", "Barcode"],
+        "sku":           ["sku", "SKU"],
+        "brand":         ["brand", "Brand"],
+        "description":   ["description", "Description"],
+        "vat_enabled":   ["vat_enabled", "VAT Enabled"],
+        "track_stock":   ["track_stock", "Track Stock"],
+    }
+
+    removed_uids = set()
+    changed_count = 0
+
+    for change in changes:
+        uid = change.get("uid") or ""
+        field = change.get("field") or ""
+        new_val = change.get("new")
+        if not uid or not field:
+            continue
+        if field == "__remove":
+            removed_uids.add(uid)
+            continue
+        idx = uid_map.get(uid)
+        if idx is None:
+            continue
+        row = dict(products[idx])
+        for key in field_aliases.get(field, [field]):
+            row[key] = new_val
+        products[idx] = row
+        changed_count += 1
+
+    final = [r for r in products if (r.get("_uid") or r.get("unique_id") or "") not in removed_uids]
+
+    return final, {
+        "ai_instructions_applied": True,
+        "ai_instruction_summary": summary,
+        "ai_instruction_changed": changed_count,
+        "ai_instruction_removed": len(removed_uids),
+    }
+
+
+def apply_ai_instruction_postprocess(products, user_instructions="", vat_enabled="Yes", track_stock_enabled=True, gemini_api_key=""):
+    """Apply AI instructions to spreadsheet-extracted rows.
+
+    Always applies deterministic defaults (VAT, track_stock, barcode, category inference).
+    Then if instructions present: tries Gemini for full coverage, falls back to regex.
+    """
     barcode_filled = 0
     stock_filled = 0
+    categories_inferred = 0
+    out_default = []
 
     for original in products:
         row = dict(original)
+        category = normalise_text(row.get("category") or row.get("Category"))
+        if not category or category.lower() == "uncategorised":
+            inferred = infer_category_from_title_for_instructions(row)
+            if inferred:
+                row["category"] = row["Category"] = inferred
+                categories_inferred += 1
+
+        code = best_code(row)
+        if code:
+            if not clean_code(row.get("barcode") or row.get("Barcode")):
+                row["barcode"] = row["Barcode"] = code
+                barcode_filled += 1
+            if not clean_code(row.get("sku") or row.get("SKU")):
+                row["sku"] = row["SKU"] = code
+
+        row["vat_enabled"] = "Yes" if str(vat_enabled).lower() in {"yes", "true", "1", "y"} else "No"
+        row["VAT Enabled"] = row["vat_enabled"]
+
+        if not normalise_text(row.get("track_stock") or row.get("Track Stock")):
+            row["track_stock"] = row["Track Stock"] = ("Variant" if row_is_variant(row) else "Product") if track_stock_enabled else "No"
+            stock_filled += 1
+
+        out_default.append(row)
+
+    raw_instructions = (user_instructions or "").strip()
+    if not raw_instructions:
+        return out_default, {
+            "ai_instruction_rows_removed": 0,
+            "ai_instruction_exclusion_terms": [],
+            "ai_instruction_categories_inferred": categories_inferred,
+            "ai_instruction_categories_renamed": 0,
+            "ai_instruction_names_cleaned": 0,
+            "ai_instruction_barcodes_filled": barcode_filled,
+            "ai_instruction_stock_filled": stock_filled,
+            "ai_instructions_applied": False,
+        }
+
+    api_key_available = bool(
+        str(gemini_api_key or "").strip()
+        or os.environ.get("GEMINI_API_KEY", "").strip()
+        or os.environ.get("GOOGLE_API_KEY", "").strip()
+        or os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY", "").strip()
+        or os.environ.get("API_KEY", "").strip()
+    )
+
+    if api_key_available:
+        final_products, gemini_meta = _apply_instructions_via_gemini(out_default, raw_instructions, gemini_api_key)
+        if gemini_meta.get("ai_instructions_applied"):
+            gemini_meta.update({
+                "ai_instruction_barcodes_filled": barcode_filled,
+                "ai_instruction_stock_filled": stock_filled,
+                "ai_instruction_categories_inferred": categories_inferred,
+            })
+            return final_products, gemini_meta
+
+    # Regex fallback
+    instructions = normalise_text(raw_instructions)
+    exclusions = _instruction_exclusion_terms(instructions)
+    rename_rules = _instruction_rename_rules(raw_instructions)
+    removed = 0
+    categories_renamed = 0
+    cleaned_names = 0
+    out = []
+
+    for row in out_default:
         haystack = normalise_for_compare(" ".join([
             title_value(row),
             normalise_text(row.get("category") or row.get("Category")),
@@ -3471,21 +3657,11 @@ def apply_ai_instruction_postprocess(products: List[Dict[str, Any]], user_instru
             cleaned_names += 1
 
         category = normalise_text(row.get("category") or row.get("Category"))
-        if not category or category.lower() == "uncategorised":
-            inferred = infer_category_from_title_for_instructions(row)
-            if inferred:
-                row["category"] = row["Category"] = inferred
-                categories_inferred += 1
-                category = inferred
-
-        # Apply rename rules: match current category against each rule's from-key.
         if rename_rules and category:
             cat_key = normalise_for_compare(category)
             for frm_key, to_display in rename_rules:
                 if frm_key in cat_key or cat_key in frm_key:
-                    row["category"] = to_display
-                    row["Category"] = to_display
-                    # Also update active_category fields used in composite key
+                    row["category"] = row["Category"] = to_display
                     if row.get("active_category"):
                         row["active_category"] = to_display
                     if row.get("_active_category"):
@@ -3493,20 +3669,6 @@ def apply_ai_instruction_postprocess(products: List[Dict[str, Any]], user_instru
                     categories_renamed += 1
                     break
 
-        code = best_code(row)
-        if code:
-            if not clean_code(row.get("barcode") or row.get("Barcode")):
-                row["barcode"] = row["Barcode"] = code
-                barcode_filled += 1
-            if not clean_code(row.get("sku") or row.get("SKU")):
-                row["sku"] = row["SKU"] = code
-
-        row["vat_enabled"] = "Yes" if str(vat_enabled).lower() in {"yes", "true", "1", "y"} else "No"
-        row["VAT Enabled"] = row["vat_enabled"]
-
-        if not normalise_text(row.get("track_stock") or row.get("Track Stock")):
-            row["track_stock"] = row["Track Stock"] = ("Variant" if row_is_variant(row) else "Product") if track_stock_enabled else "No"
-            stock_filled += 1
         out.append(row)
 
     return out, {
@@ -3519,6 +3681,7 @@ def apply_ai_instruction_postprocess(products: List[Dict[str, Any]], user_instru
         "ai_instruction_stock_filled": stock_filled,
         "ai_instructions_applied": bool(instructions),
     }
+
 
 def parse_uploaded_file_ai_assisted(file_storage, parse_mode: str = "variant", gemini_api_key: str = "", user_instructions: str = "") -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """New architecture entrypoint.
