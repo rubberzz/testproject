@@ -321,16 +321,53 @@ _SAFE_IMPLIED_VARIANT_WORDS = {
     "tonic", "pink tonic", "pink & tonic", "guarana",
 }
 
+_CLOTHING_SIZE_TOKEN_RE = re.compile(r"\b(?:XS|S|M|L|XL|XXL|XXXL|2XL|3XL|4XL|5XL|6XL|Small|Medium|Large)\b", re.I)
+_CLOTHING_NUMERIC_SIZE_RE = re.compile(r"(?:^|/)\s*\d{2,3}\s*(?:$|/)")
+_TRAILING_COLOUR_RE = re.compile(
+    r"\b("
+    r"black|white|olive|green|khaki|navy|blue|red|grey|gray|charcoal|stone|sand|tan|brown|"
+    r"beige|cream|orange|yellow|purple|pink|maroon|burgundy|camo|camouflage|denim"
+    r")\s*$",
+    re.I,
+)
+
+
+def _looks_like_clothing_size_variant_value(value: Any) -> bool:
+    """True for variant values such as 'olive / S / 36' or 'XL / 48'.
+
+    The muddled-name repair step must not convert these back to singles.
+    """
+    text = clean_product_title(value)
+    if not text or "/" not in text:
+        return False
+    return bool(_CLOTHING_SIZE_TOKEN_RE.search(text) or _CLOTHING_NUMERIC_SIZE_RE.search(text))
+
+
+def split_trailing_colour_from_base(base: str) -> Tuple[str, str]:
+    """Move a trailing colour from a flattened Shopify title into the variant value.
+
+    Example:
+      base='Men\'s Bush Shirt: Long-Sleeve (Tech) olive'
+      -> ('Men\'s Bush Shirt: Long-Sleeve (Tech)', 'olive')
+    """
+    base = clean_product_title(base)
+    match = _TRAILING_COLOUR_RE.search(base)
+    if not match:
+        return base, ""
+    colour = match.group(1).strip()
+    clean_base = base[:match.start()].strip(" -·•,/\\")
+    if len(clean_base) < 4:
+        return base, ""
+    return clean_base, colour
+
 
 def _is_suspicious_embedded_descriptor(value: Any) -> bool:
     v = clean_product_title(value).lower()
     v_norm = normalise_for_compare(v)
     if not v_norm:
         return False
-    # Clothing/Shopify variant labels such as "S / 36" or "olive / XL / 48"
-    # are valid variants. Do not let the name-repair pass convert them back to
-    # single products.
-    if looks_like_clothing_size_combo(v):
+    # Values such as 'olive / S / 36' are true clothing variants, not muddled product descriptors.
+    if _looks_like_clothing_size_variant_value(value):
         return False
     if v_norm in {normalise_for_compare(x) for x in _SAFE_IMPLIED_VARIANT_WORDS}:
         return False
@@ -339,8 +376,7 @@ def _is_suspicious_embedded_descriptor(value: Any) -> bool:
     # Product descriptors with liquor/category terms should stay in the name.
     if re.search(r"\b(label|malt|lager|lite|stout|whisky|whiskey|scotch|vodka|gin|rum|draught|draft|pilsner)\b", v, re.I):
         return True
-    # Long phrases are usually not simple flavour/size variants, unless they are
-    # recognised clothing size combinations above.
+    # Long phrases are usually not simple flavour/size variants.
     return len(v.split()) >= 3
 
 
@@ -1428,76 +1464,6 @@ def infer_flavour_variant_from_title(title: str) -> Optional[Tuple[str, str, str
     return None
 
 
-
-_COLOUR_PHRASES = {
-    "olive", "black", "white", "navy", "blue", "red", "green", "grey", "gray",
-    "charcoal", "stone", "khaki", "brown", "tan", "beige", "cream", "orange",
-    "yellow", "pink", "purple", "maroon", "burgundy", "natural", "sand",
-    "dark olive", "light olive", "dark grey", "light grey", "dark gray", "light gray",
-    "royal blue", "sky blue", "forest green", "bottle green", "off white",
-}
-
-_CLOTHING_SIZE_TOKEN_RE = re.compile(r"^(?:XS|S|M|L|XL|XXL|XXXL|2XL|3XL|4XL|5XL|Small|Medium|Large|Extra Large)$", re.I)
-_NUMERIC_SIZE_TOKEN_RE = re.compile(r"^\d+(?:[,.]\d+)?$", re.I)
-
-
-def looks_like_clothing_size_combo(value: Any) -> bool:
-    """True for variant labels such as S / 36, olive / XL / 48.
-
-    These are legitimate Shopify/clothing variant values and must never be
-    treated as suspicious product descriptors by the name-repair logic.
-    """
-    text = clean_product_title(value)
-    if not text or " / " not in text:
-        return False
-    parts = [p.strip() for p in text.split(" / ") if p.strip()]
-    if len(parts) < 2:
-        return False
-    has_size = any(_CLOTHING_SIZE_TOKEN_RE.match(p) for p in parts)
-    has_numeric = any(_NUMERIC_SIZE_TOKEN_RE.match(p) for p in parts)
-    return has_size and has_numeric
-
-
-def split_flattened_shopify_variant_prefix(first_part: str, value_parts: List[str]) -> Tuple[str, str]:
-    """Split flattened Shopify titles into product base and combined variant.
-
-    Some extracts arrive as a single product name rather than Shopify option
-    columns, for example:
-      Men's Bush Shirt: Long-Sleeve (Tech) olive / S / 36
-
-    The old slash parser used the first part as the base, producing:
-      Product: Men's Bush Shirt... olive
-      Variant: S / 36
-
-    This helper recognises clothing size patterns and moves the trailing colour
-    into the variant value:
-      Product: Men's Bush Shirt: Long-Sleeve (Tech)
-      Variant: olive / S / 36
-    """
-    base_part = clean_product_title(first_part)
-    clean_values = [clean_product_title(v) for v in value_parts if clean_product_title(v)]
-    if len(clean_values) >= 2 and _CLOTHING_SIZE_TOKEN_RE.match(clean_values[0]) and _NUMERIC_SIZE_TOKEN_RE.match(clean_values[1]):
-        base_norm = normalise_for_compare(base_part)
-        for colour in sorted(_COLOUR_PHRASES, key=len, reverse=True):
-            colour_norm = normalise_for_compare(colour)
-            if base_norm.endswith(" " + colour_norm):
-                # Remove the matched trailing colour from the display base.
-                m = re.search(r"\s+" + re.escape(colour) + r"\s*$", base_part, flags=re.I)
-                if m:
-                    base = base_part[:m.start()].strip(" -·•,/\\")
-                    value = " / ".join([base_part[m.start():].strip(), *clean_values])
-                    if base and value:
-                        return clean_product_title(base), clean_product_title(value)
-        # Fallback for lower-case colour-like final words, but avoid cutting a
-        # product word after a closing bracket/title case phrase.
-        m = re.match(r"^(.+?)\s+([a-z][a-z -]{2,30})$", base_part)
-        if m:
-            base = m.group(1).strip(" -·•,/\\")
-            colour = m.group(2).strip()
-            if base and colour and not colour.endswith(")"):
-                return clean_product_title(base), clean_product_title(" / ".join([colour, *clean_values]))
-    return base_part, " / ".join(clean_values)
-
 def variant_candidates_from_title(title: str) -> List[Tuple[str, str, str, str]]:
     """Return possible variant parses as (base, attribute, value, kind)."""
     title = normalise_text(title)
@@ -1527,16 +1493,21 @@ def variant_candidates_from_title(title: str) -> List[Tuple[str, str, str, str]]
         def _is_pure_money(s: str) -> bool:
             return bool(re.fullmatch(r"[Rr]?\s*[0-9][0-9,. ]*", s.strip()))
         if len(parts) >= 3:
-            # Default slash logic: last two parts are the explicit variant suffix.
-            # Special Shopify/clothing fallback: if the suffix is Size / Number
-            # and the first part ends in a colour, move that colour into the
-            # variant value so rows group under the real product name.
+            base = " / ".join(parts[:-2]).strip(" -\u00b7\u2022,/\\")
             value_parts = parts[-2:]
-            base_seed = " / ".join(parts[:-2]).strip(" -\u00b7\u2022,/\\")
-            base, value = split_flattened_shopify_variant_prefix(base_seed, value_parts)
+            value = " / ".join(value_parts).strip()
+            # Shopify clothing rows often arrive already flattened as:
+            #   Product Name colour / S / 36
+            # Move the trailing colour from the base into the variant value so
+            # the product groups correctly as Product Name with variants
+            # 'colour / S / 36', not as Product Name colour.
+            clean_base, colour = split_trailing_colour_from_base(base)
+            if colour and not value.lower().startswith(colour.lower() + " /"):
+                base = clean_base
+                value = f"{colour} / {value}".strip(" /")
             # Reject only if ALL value segments look like standalone prices
             if base and value and len(base) >= 5 and not all(_is_pure_money(p) for p in value_parts):
-                candidates.append((base, "Variant", value, "shopify-slash" if looks_like_clothing_size_combo(value) else "slash"))
+                candidates.append((base, "Variant", value, "slash"))
         elif len(parts) == 2:
             base = parts[0].strip(" -\u00b7\u2022,/\\")
             value = parts[1].strip()
@@ -1609,7 +1580,7 @@ def infer_variants_from_titles(products: List[Dict[str, Any]]) -> List[Dict[str,
             candidate_groups.setdefault(key, []).append((row, attr_value, base, kind))
 
     valid_groups: List[Tuple[int, int, Tuple[str, str, str], List[Tuple[Dict[str, Any], str, str, str]]]] = []
-    kind_priority = {"middle-dot": 0, "shopify-slash": 0, "slash": 1, "dash": 2, "flavour": 3, "clothing-size": 4, "size": 5}
+    kind_priority = {"middle-dot": 0, "slash": 1, "dash": 2, "flavour": 3, "clothing-size": 4, "size": 5}
     for key, rows in candidate_groups.items():
         if len(rows) <= 1:
             continue
