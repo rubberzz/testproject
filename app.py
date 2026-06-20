@@ -456,6 +456,58 @@ def repair_muddled_extracted_variant_names(products: List[Dict[str, Any]]) -> in
     return changed
 
 
+def humanize_handle(handle: str) -> str:
+    """Convert a URL slug / handle into a readable product name.
+
+    'drawstring-paneled-wide-leg-casual-pants-casual-pants-420'
+    → 'Drawstring Paneled Wide-Leg Casual Pants'
+
+    Strategy:
+    1. Split on hyphens.
+    2. Remove pure-numeric tokens (SKU suffixes like 420, 300).
+    3. Detect and strip repeated subsequences that Shopify sometimes
+       appends (e.g. handle = slug-of-title + "-" + sku).
+    4. Title-case the result.
+    """
+    if not handle:
+        return ""
+    tokens = handle.lower().replace("_", "-").split("-")
+    # Drop trailing numeric tokens (sku / id suffixes)
+    while tokens and tokens[-1].isdigit():
+        tokens = tokens[:-1]
+    if not tokens:
+        return handle.replace("-", " ").title()
+    # Detect and strip repeated subsequences
+    # e.g. ["drawstring","paneled","wide","leg","casual","pants",
+    #        "casual","pants"] → keep first occurrence only
+    seen: list = []
+    i = 0
+    while i < len(tokens):
+        # Try longest non-overlapping match for a repeated block
+        found_repeat = False
+        for length in range(len(tokens) - i, 1, -1):
+            sub = tokens[i:i + length]
+            rest = tokens[i + length:]
+            # Check if `sub` appears in `rest`
+            for j in range(len(rest) - length + 1):
+                if rest[j:j + length] == sub:
+                    # It does — skip this occurrence in rest
+                    tokens = tokens[:i + length] + rest[:j] + rest[j + length:]
+                    found_repeat = True
+                    break
+            if found_repeat:
+                break
+        seen.append(tokens[i])
+        i += 1
+    # Strip leading tokens that are ≤ 2 chars — these are truncated name
+    # fragments that leaked into the slug (e.g. 'cu' from 'Cu' = 'Cuffed...').
+    while seen and len(seen[0]) <= 2 and seen[0].isalpha():
+        seen = seen[1:]
+    if not seen:
+        return handle.replace("-", " ").title()
+    return " ".join(t.capitalize() for t in seen)
+
+
 def slugify(value: Any) -> str:
     text = normalise_text(value).lower().replace("×", "x")
     text = text.replace("&", "and")
@@ -1871,8 +1923,63 @@ def find_yoco_header_row(raw_df: pd.DataFrame) -> Optional[int]:
     return None
 
 
+def _clean_yoco_category(raw_cat: str, product_id: str) -> str:
+    """Sanitize a category value from a Yoco CSV export.
+
+    Corrupted categories occur when the original spreadsheet had cells whose
+    content overflowed into the Category column.  Symptoms:
+    - Contains slashes with size/colour tokens: 'ee/S', 'ed Sweatpants/black/L'
+    - Starts with a lowercase fragment and slash: 'age Cargo Pants/camou'
+    - Is just a size code: '/XL', '-white/M'
+
+    Strategy:
+    1. If the category contains a slash, split on the first slash and keep the
+       left part — but only if it looks like a real category (title-case words,
+       no leading dash/number, length >= 3 after stripping).
+    2. If the left part still looks like a corrupted fragment (all-lowercase
+       mid-word, starts with lowercase, or < 3 chars), try to recover the real
+       category from the product_id slug.
+    3. Return "Uncategorised" if nothing recoverable.
+    """
+    import re as _re
+    if not raw_cat:
+        return "Uncategorised"
+    cat = raw_cat.strip()
+
+    # Clothing size tokens — if the whole category IS just a size, it's corrupted
+    _SIZE_ONLY = _re.compile(
+        r'^[/-]?(?:xs|s|m|l|xl|xxl|xxxl|2xl|3xl|\d{2,3}|\d+\s*cm|\d+\s*ml)$', _re.IGNORECASE
+    )
+    if _SIZE_ONLY.match(cat):
+        return "Uncategorised"
+
+    # Strip leading dashes/slashes
+    cat = cat.lstrip('-/ ')
+
+    if '/' in cat:
+        left = cat.split('/')[0].strip()
+        # Accept the left part only if it looks like a real category name:
+        # at least 3 chars, not all-lowercase mid-word fragment
+        if len(left) >= 3 and (left[0].isupper() or left.istitle()):
+            return left
+        # Left part is a fragment — the whole value is garbage; fall through
+        return "Uncategorised"
+
+    # No slash — check if it looks like a mid-word fragment (starts lowercase,
+    # very short, or ends with a size token)
+    _FRAG = _re.compile(r'^[a-z]{1,3}\s', _re.IGNORECASE)
+    if len(cat) <= 2 or _FRAG.match(cat):
+        return "Uncategorised"
+
+    return cat
+
+
 def parse_yoco_products_export_sheet(raw_df: pd.DataFrame, source_sheet: str) -> List[Dict[str, Any]]:
-    """Parse a Yoco Products sheet while preserving variants correctly."""
+    """Parse a Yoco Products sheet while preserving variants correctly.
+
+    Handles both clean exports and corrupted ones where category/name columns
+    have been truncated or contain overflow text from adjacent cells.
+    """
     header_idx = find_yoco_header_row(raw_df)
     if header_idx is None:
         return []
@@ -1884,48 +1991,91 @@ def parse_yoco_products_export_sheet(raw_df: pd.DataFrame, source_sheet: str) ->
     def col(name: str) -> Optional[str]:
         return hmap.get(normalise_header(name))
 
+    # ── Pass 1: parse all rows ──────────────────────────────────────────────
     products: List[Dict[str, Any]] = []
     for offset, (_, series) in enumerate(data.iterrows(), start=header_idx + 2):
         record = series.to_dict()
-        product_id = normalise_text(record.get(col("Product ID"))) if col("Product ID") else ""
+        product_id  = normalise_text(record.get(col("Product ID")))  if col("Product ID")  else ""
         product_name = normalise_text(record.get(col("Product Name"))) if col("Product Name") else ""
         if not product_id and not product_name:
             continue
-        default_price = parse_money(record.get(col("Default Price"))) if col("Default Price") else 0.0
-        variant_price = parse_money(record.get(col("Variant Price"))) if col("Variant Price") else 0.0
-        price = variant_price or default_price
+
+        default_price  = parse_money(record.get(col("Default Price")))      if col("Default Price")      else 0.0
+        variant_price  = parse_money(record.get(col("Variant Price")))       if col("Variant Price")       else 0.0
+        price          = variant_price or default_price
         variant_enabled_raw = normalise_text(record.get(col("Variant Enabled"))) if col("Variant Enabled") else ""
         variant_enabled = "Yes" if variant_enabled_raw.lower() == "yes" else "No"
-        sku = clean_code(record.get(col("SKU"))) if col("SKU") else ""
+        sku     = clean_code(record.get(col("SKU")))     if col("SKU")     else ""
         barcode = clean_code(record.get(col("Barcode"))) if col("Barcode") else ""
-        code = barcode or sku
+        code    = barcode or sku
+
+        raw_cat = normalise_text(record.get(col("Category"))) if col("Category") else ""
+        category = _clean_yoco_category(raw_cat, product_id)
+
+        # ── Recover truncated / missing product name from the product_id slug ──
+        # A truncated name is very short (< 4 chars) or still contains only
+        # lower-case slug characters despite a human-readable PID being present.
+        name_looks_truncated = (
+            not product_name
+            or len(product_name.strip()) < 4
+            or (product_name == product_name.lower() and "-" in product_name)
+        )
+        if name_looks_truncated and product_id:
+            recovered = humanize_handle(product_id)
+            if recovered and len(recovered) >= len(product_name or ""):
+                product_name = recovered
+
         row = {
-            "product_id": product_id or slugify(product_name or code or f"product-{offset}"),
-            "product_name": product_name or product_id,
-            "description": normalise_text(record.get(col("Description"))) if col("Description") else "",
-            "category": normalise_text(record.get(col("Category"))) if col("Category") else source_sheet or "Uncategorised",
-            "brand": normalise_text(record.get(col("Brand"))) if col("Brand") else "",
-            "sku": sku or code,
-            "barcode": barcode or code,
-            "selling_price": float(default_price or price),
+            "product_id":    product_id or slugify(product_name or code or f"product-{offset}"),
+            "product_name":  product_name or humanize_handle(product_id) or product_id,
+            "description":   normalise_text(record.get(col("Description"))) if col("Description") else "",
+            "category":      category or source_sheet or "Uncategorised",
+            "brand":         normalise_text(record.get(col("Brand")))     if col("Brand")     else "",
+            "sku":           sku or code,
+            "barcode":       barcode or code,
+            "selling_price":    float(default_price or price),
             "calculated_price": float(price or default_price),
-            "variant_price": float(price or default_price),
-            "cost_price": parse_money(record.get(col("Default Cost Price"))) if col("Default Cost Price") else 0.0,
-            "image_url": normalise_text(record.get(col("Image URL"))) if col("Image URL") else "",
+            "variant_price":    float(price or default_price),
+            "cost_price":    parse_money(record.get(col("Default Cost Price"))) if col("Default Cost Price") else 0.0,
+            "image_url":     normalise_text(record.get(col("Image URL"))) if col("Image URL") else "",
             "variant_enabled": variant_enabled,
             "attr1_name": normalise_text(record.get(col("Attribute 1"))) if col("Attribute 1") else "",
-            "attr1_val": normalise_text(record.get(col("Value 1"))) if col("Value 1") else "",
+            "attr1_val":  normalise_text(record.get(col("Value 1")))     if col("Value 1")     else "",
             "attr2_name": normalise_text(record.get(col("Attribute 2"))) if col("Attribute 2") else "",
-            "attr2_val": normalise_text(record.get(col("Value 2"))) if col("Value 2") else "",
+            "attr2_val":  normalise_text(record.get(col("Value 2")))     if col("Value 2")     else "",
             "attr3_name": normalise_text(record.get(col("Attribute 3"))) if col("Attribute 3") else "",
-            "attr3_val": normalise_text(record.get(col("Value 3"))) if col("Value 3") else "",
+            "attr3_val":  normalise_text(record.get(col("Value 3")))     if col("Value 3")     else "",
             "track_stock": normalise_text(record.get(col("Track Stock"))) if col("Track Stock") else ("Variant" if variant_enabled == "Yes" else "Product"),
-            "source_sheet": source_sheet,
-            "source_row": int(offset),
+            "source_sheet":   source_sheet,
+            "source_row":     int(offset),
             "source_context": "Yoco Products sheet",
         }
         set_category_code_identity(row, row.get("category"))
         products.append(row)
+
+    # ── Pass 2: sanitize attr values that look like price/size overflow ──────
+    # When the CSV was truncated, Value 1 may contain a price number and
+    # Value 2 a size. Detect and drop these.
+    _PRICE_LIKE = re.compile(r'^\d{2,6}(\.\d{1,2})?$')
+    _SIZE_LIKE   = re.compile(r'^(?:xs|s|m|l|xl|xxl|2xl|3xl|\d{2,3})$', re.IGNORECASE)
+    for row in products:
+        v1 = (row.get("attr1_val") or "").strip()
+        v2 = (row.get("attr2_val") or "").strip()
+        # If attr1_val is a bare price number (with or without a size in v2), it's overflow
+        if _PRICE_LIKE.match(v1) and (not v2 or _SIZE_LIKE.match(v2) or len(v2) <= 3):
+            row["attr1_name"] = ""
+            row["attr1_val"]  = ""
+            row["attr2_name"] = ""
+            row["attr2_val"]  = ""
+            row["variant_enabled"] = "No"
+        # If attr1_val is a 2-3 char fragment ('co', 'bl') it's overflow too
+        elif len(v1) <= 2 and v1.isalpha() and v1 == v1.lower():
+            row["attr1_name"] = ""
+            row["attr1_val"]  = ""
+            row["attr2_name"] = ""
+            row["attr2_val"]  = ""
+            row["variant_enabled"] = "No"
+
     return products
 
 def is_shopify_export_sheet(raw_df: pd.DataFrame) -> bool:
@@ -2089,8 +2239,13 @@ def parse_shopify_export_sheet(raw_df: pd.DataFrame, source_sheet: str) -> List[
             # Product image/detail continuation row, not a sellable variant.
             continue
 
-        product_id = slugify(current["handle"] or current["title"])
-        product_name = current["title"] or current["handle"]
+        # Always prefer the human-readable Title.
+        # Only fall back to the handle if Title is genuinely absent, and
+        # humanize it so URL slugs don't leak into the product name.
+        _title = current["title"]
+        _handle = current["handle"]
+        product_name = _title or humanize_handle(_handle) or _handle
+        product_id = slugify(_handle or _title)
         row = {
             "product_id": product_id,
             "product_name": product_name,
@@ -2544,6 +2699,12 @@ def apply_category_prefix(row: Dict[str, Any], current_category: str) -> Dict[st
     category = normalise_text(current_category)
     title = title_value(row)
     if not category or not title:
+        return row
+
+    # Don't prefix if the category looks like a URL slug (hyphenated, no spaces)
+    # — this means it came from a Shopify handle or similar and would produce
+    # ugly names like "casual-pants-420 - Drawstring Paneled Wide-Leg Casual Pants".
+    if "-" in category and " " not in category:
         return row
 
     title_norm = normalise_for_compare(title)
@@ -3940,6 +4101,16 @@ def parse_uploaded_file(file_storage) -> List[Dict[str, Any]]:
     if ext == "csv":
         raw = file_storage.read()
         df = pd.read_csv(io.BytesIO(raw), dtype=object, header=None)
+        # Yoco product export CSVs must be parsed by the dedicated parser so
+        # that variant rows, price columns, and attribute columns are handled
+        # correctly.  The generic parser collapses variants and misreads them.
+        if is_yoco_products_export_sheet(df):
+            products.extend(parse_yoco_products_export_sheet(df, "CSV"))
+            return products
+        # Shopify CSV exports
+        if is_shopify_export_sheet(df):
+            products.extend(parse_shopify_export_sheet(df, "CSV"))
+            return products
         cleaned = dataframe_from_sheet(df)
         products.extend(parse_cleaned_rows_with_category_state(cleaned, df, "CSV"))
         return products
