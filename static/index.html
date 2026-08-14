@@ -1,71 +1,2230 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Yoco Retail Import Processor</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RetailScan AI | Yoco POS Import Tool</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
   <style>
-    body { font-family: Arial, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 20px; }
-    .card { border: 1px solid #ddd; border-radius: 12px; padding: 24px; }
-    button { padding: 10px 16px; cursor: pointer; }
-    #status { margin-top: 16px; white-space: pre-wrap; }
+    :root {
+      --yds-font-display:"Space Grotesk",system-ui,sans-serif;
+      --yds-font-sans:"Inter",system-ui,-apple-system,sans-serif;
+      --yds-font-mono:"JetBrains Mono","Courier New",monospace;
+      --yds-white:#FFFFFF; --yds-grey-40:#F6F6F6; --yds-grey-90:#E9E9E9;
+      --yds-grey-170:#D9D9D9; --yds-grey-330:#B5B5B5; --yds-grey-540:#767676;
+      --yds-grey-690:#4E4E4E; --yds-grey-780:#383838; --yds-grey-830:#2B2B2B; --yds-grey-870:#222222;
+      --yds-blue-40:#ECF7FC; --yds-blue-90:#D4EEF9; --yds-blue-170:#A5E5FA;
+      --yds-blue-330:#58B5FA; --yds-blue-540:#0099E0; --yds-blue-690:#005570; --yds-blue-830:#003A55;
+      --yds-green-40:#E9F2EF; --yds-green-540:#118E6B; --yds-green-690:#0A6C51;
+      --yds-yellow-40:#FFF8E8; --yds-yellow-170:#FFDEA3; --yds-yellow-540:#FF9E00; --yds-yellow-690:#9E6700;
+      --yds-red-40:#FCECEE; --yds-red-170:#F8A7B1; --yds-red-540:#EB001F; --yds-red-690:#911724;
+      --yds-orange-40:#FFF1EC; --yds-orange-540:#F15A28;
+      --bg-primary:var(--yds-white); --bg-secondary:var(--yds-grey-40); --bg-tertiary:var(--yds-grey-90);
+      --bg-brand:var(--yds-blue-540); --bg-inverse:var(--yds-grey-870);
+      --bg-success:var(--yds-green-540); --bg-warning:var(--yds-yellow-540);
+      --bg-critical:var(--yds-red-540); --bg-info:var(--yds-blue-90);
+      --content-primary:var(--yds-grey-870); --content-secondary:var(--yds-grey-540);
+      --content-tertiary:var(--yds-grey-330); --content-inverse:var(--yds-white);
+      --content-brand:var(--yds-blue-540); --content-success:var(--yds-green-540);
+      --content-critical:var(--yds-red-540); --content-warning:var(--yds-yellow-690);
+      --border-subtle:var(--yds-grey-90); --border-default:var(--yds-grey-170);
+      --border-strong:var(--yds-grey-540); --border-focus:var(--yds-blue-540);
+      --border-critical:var(--yds-red-540);
+      --shadow-xs:0 1px 2px 0 rgba(0,0,0,0.08); --shadow-sm:0 2px 6px 0 rgba(0,0,0,0.10);
+      --shadow-md:0 3px 12px 0 rgba(0,0,0,0.08),0 8px 24px 0 rgba(0,0,0,0.12);
+      --shadow-lg:0 3px 12px 0 rgba(0,0,0,0.08),0 16px 48px 0 rgba(0,0,0,0.16);
+      --space-xxs:4px; --space-xs:8px; --space-s:12px; --space-m:16px;
+      --space-l:24px; --space-xl:36px; --space-xxl:52px; --space-xxxl:80px;
+      --radius-s:8px; --radius-m:12px; --radius-l:24px; --radius-xl:36px; --radius-pill:1000px;
+      --ease:cubic-bezier(0.2,0,0,1);
+    }
+    *,*::before,*::after{box-sizing:border-box}
+    html,body{margin:0;padding:0;font-family:var(--yds-font-sans);font-size:15px;line-height:1.5;color:var(--content-primary);background:var(--bg-secondary);-webkit-font-smoothing:antialiased}
+    h1,h2,h3{margin:0}
+    h1{font-family:var(--yds-font-display);font-size:44px;font-weight:600;line-height:1.15;letter-spacing:-0.01em}
+    h2{font-family:var(--yds-font-sans);font-size:20px;font-weight:600;line-height:1.25}
+    h3{font-family:var(--yds-font-sans);font-size:15px;font-weight:600}
+    .label-caps{font-family:var(--yds-font-sans);font-size:11px;font-weight:500;text-transform:uppercase;letter-spacing:0.06em;color:var(--content-secondary)}
+    .mono{font-family:var(--yds-font-mono)}
+    .page{max-width:1400px;margin:0 auto;padding:var(--space-xl) var(--space-l)}
+    .top-bar{background:var(--bg-primary);border-bottom:1px solid var(--border-subtle);position:sticky;top:0;z-index:100}
+    .top-bar-inner{max-width:1400px;margin:0 auto;padding:var(--space-m) var(--space-l);display:flex;align-items:center;justify-content:space-between}
+    .top-bar-left{display:flex;align-items:center;gap:var(--space-m)}
+    .yoco-wordmark{height:24px;width:auto;display:block}
+    .divider{width:1px;height:24px;background:var(--border-default)}
+    .app-name{font-size:13px;font-weight:500;color:var(--content-secondary)}
+    .two-col{display:grid;grid-template-columns:360px 1fr;gap:var(--space-l);align-items:start}
+    .left-col{display:flex;flex-direction:column;gap:var(--space-m)}
+    .right-col{display:flex;flex-direction:column;gap:var(--space-m)}
+    .card{background:var(--bg-primary);border-radius:var(--radius-m);border:1px solid var(--border-subtle);padding:var(--space-l);box-shadow:var(--shadow-xs)}
+    .card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:var(--space-m)}
+    .btn{display:inline-flex;align-items:center;justify-content:center;gap:var(--space-xs);border:none;cursor:pointer;font-family:var(--yds-font-sans);font-size:15px;font-weight:500;border-radius:var(--radius-pill);padding:12px 24px;transition:all 150ms var(--ease);white-space:nowrap;text-decoration:none}
+    .btn:active{transform:scale(0.98)}
+    .btn:disabled{background:var(--bg-tertiary)!important;color:var(--content-tertiary)!important;cursor:not-allowed;transform:none!important}
+    .btn-primary{background:var(--yds-grey-870);color:var(--content-inverse)}
+    .btn-primary:hover:not(:disabled){background:var(--yds-grey-780)}
+    .btn-brand{background:var(--yds-blue-540);color:var(--content-inverse)}
+    .btn-brand:hover:not(:disabled){background:var(--yds-blue-690)}
+    .btn-secondary{background:var(--bg-secondary);color:var(--content-primary)}
+    .btn-secondary:hover:not(:disabled){background:var(--bg-tertiary)}
+    .btn-ghost{background:transparent;color:var(--content-primary);border:1px solid var(--border-default)}
+    .btn-ghost:hover:not(:disabled){background:var(--bg-secondary)}
+    .btn-critical{background:var(--bg-critical);color:var(--content-inverse)}
+    .btn-critical:hover:not(:disabled){background:var(--yds-red-690)}
+    .btn-sm{font-size:13px;padding:8px 16px}
+    .btn-full{width:100%}
+    .field{display:flex;flex-direction:column;gap:6px}
+    .field-label{font-size:13px;font-weight:500;color:var(--content-primary)}
+    .field-hint{font-size:11px;color:var(--content-secondary)}
+    .input{font-family:var(--yds-font-sans);font-size:15px;padding:12px var(--space-m);border-radius:var(--radius-m);border:1px solid var(--border-default);background:var(--bg-primary);color:var(--content-primary);outline:none;transition:border-color 150ms var(--ease),box-shadow 150ms var(--ease);width:100%}
+    .input::placeholder{color:var(--content-tertiary)}
+    .input:focus{border-color:var(--border-focus);box-shadow:0 0 0 3px var(--yds-blue-90)}
+    .tab-group{display:flex;gap:0;background:var(--bg-secondary);border:1px solid var(--border-default);border-radius:var(--radius-pill);padding:3px}
+    .tab-wrap{position:relative;flex:1}
+    .tab-wrap .tab{width:100%}
+    .tab{flex:1;padding:8px 20px;border:none;background:transparent;cursor:pointer;font-family:var(--yds-font-sans);font-size:13px;font-weight:500;border-radius:var(--radius-pill);color:var(--content-secondary);transition:all 150ms var(--ease)}
+    .tab.active{background:var(--bg-primary);color:var(--content-primary);box-shadow:var(--shadow-xs)}
+    .tab:not(.active):hover{color:var(--content-primary)}
+    .tab-tooltip{position:absolute;bottom:calc(100% + 10px);left:50%;transform:translateX(-50%);width:220px;background:var(--yds-grey-870);color:var(--content-inverse);font-size:12px;line-height:1.5;padding:var(--space-s) var(--space-m);border-radius:var(--radius-s);box-shadow:var(--shadow-md);pointer-events:none;opacity:0;transition:opacity 150ms var(--ease);z-index:50;text-align:left}
+    .tab-tooltip::after{content:'';position:absolute;top:100%;left:50%;transform:translateX(-50%);border:6px solid transparent;border-top-color:var(--yds-grey-870)}
+    .tab-tooltip strong{color:var(--yds-blue-170)}
+    .tab-wrap:hover .tab-tooltip{opacity:1}
+    .chip-group{display:flex;flex-wrap:wrap;gap:var(--space-xs)}
+    .chip{display:inline-flex;align-items:center;gap:4px;padding:6px 12px;border-radius:var(--radius-pill);border:1px solid var(--border-default);background:var(--bg-primary);font-family:var(--yds-font-sans);font-size:12px;font-weight:500;color:var(--content-secondary);cursor:pointer;transition:all 150ms var(--ease);white-space:nowrap}
+    .chip.active{background:var(--yds-grey-870);border-color:var(--yds-grey-870);color:var(--content-inverse)}
+    .chip:not(.active):hover{border-color:var(--border-strong);color:var(--content-primary)}
+    .chat-container{max-height:160px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--yds-grey-170) transparent}
+    .chat-container::-webkit-scrollbar{width:4px}
+    .chat-container::-webkit-scrollbar-thumb{background:var(--yds-grey-170);border-radius:999px}
+    .chat-messages{display:flex;flex-direction:column;gap:var(--space-xs)}
+    .chat-bubble{max-width:88%;padding:var(--space-xs) var(--space-s);border-radius:var(--radius-m);font-size:13px;line-height:1.5;animation:fadeUp 200ms var(--ease)}
+    .chat-bubble.assistant{background:var(--bg-secondary);border-bottom-left-radius:var(--radius-s);color:var(--content-primary)}
+    .chat-bubble.user{background:var(--yds-grey-870);color:var(--content-inverse);border-bottom-right-radius:var(--radius-s);margin-left:auto;font-weight:500}
+    .bubble-label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:var(--content-brand);display:block;margin-bottom:2px}
+    @keyframes fadeUp{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+    .drop-zone{border:1.5px dashed var(--border-default);border-radius:var(--radius-m);padding:var(--space-xl);display:flex;flex-direction:column;align-items:center;gap:var(--space-xs);cursor:pointer;background:var(--bg-primary);transition:all 150ms var(--ease);text-align:center}
+    .drop-zone:hover,.drop-zone--over{border-color:var(--yds-blue-540);background:var(--bg-info)}
+    .drop-icon{width:48px;height:48px;background:var(--bg-secondary);border-radius:var(--radius-m);display:flex;align-items:center;justify-content:center;color:var(--content-secondary);transition:all 150ms var(--ease)}
+    .drop-zone:hover .drop-icon,.drop-zone--over .drop-icon{background:var(--yds-blue-40);color:var(--yds-blue-540)}
+    .file-list{display:flex;flex-direction:column;gap:var(--space-xs);max-height:120px;overflow-y:auto}
+    .file-item{display:flex;align-items:center;justify-content:space-between;padding:var(--space-xs) var(--space-s);border-radius:var(--radius-s);background:var(--bg-secondary);border:1px solid var(--border-subtle);font-size:12px;color:var(--content-primary)}
+    .file-item span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;padding-right:var(--space-xs)}
+    .file-remove{background:none;border:none;cursor:pointer;color:var(--content-tertiary);font-size:18px;line-height:1;padding:0;flex-shrink:0;transition:color 150ms var(--ease)}
+    .file-remove:hover{color:var(--content-critical)}
+
+    /* ── Scan state (in right panel) ────────────────── */
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+    .scan-state{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:var(--space-xxl) var(--space-l);gap:var(--space-l);text-align:center}
+    .scan-ring-wrap{position:relative;width:96px;height:96px;flex-shrink:0}
+    .scan-ring-bg{fill:none;stroke:var(--yds-grey-90);stroke-width:6}
+    .scan-ring-fill{fill:none;stroke:var(--yds-blue-540);stroke-width:6;stroke-linecap:round;stroke-dasharray:251;stroke-dashoffset:251;transition:stroke-dashoffset 400ms var(--ease);transform-origin:center;transform:rotate(-90deg)}
+    .scan-counter-wrap{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+    .scan-counter-num{font-family:var(--yds-font-display);font-size:22px;font-weight:600;line-height:1;color:var(--content-primary)}
+    .scan-counter-total{font-size:11px;color:var(--content-secondary);margin-top:2px}
+    .scan-label{font-size:15px;font-weight:600;color:var(--content-primary)}
+    .scan-filename{font-size:12px;color:var(--content-secondary);max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .scan-file-list{display:flex;flex-direction:column;gap:6px;width:100%;max-width:420px}
+    .scan-file-row{border:1px solid var(--border-subtle);border-radius:var(--radius-s);background:var(--bg-primary);overflow:hidden;transition:border-color 200ms var(--ease)}
+    .scan-file-row.active{border-color:var(--yds-blue-540)}
+    .scan-file-row.done{border-color:var(--yds-green-540)}
+    .scan-file-row.error{border-color:var(--yds-red-540)}
+    .scan-file-header{display:flex;align-items:center;gap:var(--space-s);padding:8px 12px;cursor:pointer;user-select:none}
+    .scan-file-header.no-toggle{cursor:default}
+    .scan-file-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;background:var(--yds-grey-170);transition:background 200ms var(--ease)}
+    .scan-file-row.active .scan-file-dot{background:var(--yds-blue-540);animation:pulse 1s ease-in-out infinite}
+    .scan-file-row.done .scan-file-dot{background:var(--yds-green-540)}
+    .scan-file-row.error .scan-file-dot{background:var(--yds-red-540)}
+    .scan-file-name{flex:1;font-size:12px;font-weight:500;color:var(--content-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .scan-file-meta{font-size:11px;color:var(--content-secondary);white-space:nowrap;font-family:var(--yds-font-mono)}
+    .scan-file-row.active .scan-file-meta{color:var(--yds-blue-540)}
+    .scan-file-row.done .scan-file-meta{color:var(--yds-green-540)}
+    .scan-file-row.error .scan-file-meta{color:var(--yds-red-540)}
+    .scan-file-chevron{width:14px;height:14px;color:var(--content-tertiary);flex-shrink:0;transition:transform 200ms var(--ease)}
+    .scan-file-chevron.open{transform:rotate(180deg)}
+    .scan-file-pages{display:none;border-top:1px solid var(--border-subtle);padding:6px 12px;display:flex;flex-wrap:wrap;gap:4px}
+    .scan-file-pages.collapsed{display:none}
+    .scan-page-chip{font-size:10px;font-weight:500;padding:2px 7px;border-radius:var(--radius-pill);border:1px solid var(--border-subtle);color:var(--content-secondary);background:var(--bg-secondary);font-family:var(--yds-font-mono)}
+    .scan-page-chip.done{border-color:var(--yds-green-540);color:var(--yds-green-690);background:var(--yds-green-40)}
+    .scan-page-chip.active{border-color:var(--yds-blue-540);color:var(--yds-blue-690);background:var(--yds-blue-40);animation:pulse 0.8s ease-in-out infinite}
+    .scan-page-chip.error{border-color:var(--yds-red-540);color:var(--yds-red-690);background:var(--yds-red-40)}
+
+    .btn-cta{width:100%;padding:16px var(--space-l);background:var(--yds-grey-870);color:var(--content-inverse);border:none;border-radius:var(--radius-pill);font-family:var(--yds-font-sans);font-size:15px;font-weight:600;cursor:pointer;transition:all 150ms var(--ease);display:flex;flex-direction:column;align-items:center;gap:2px}
+    .btn-cta:hover:not(:disabled){background:var(--yds-grey-780)}
+    .btn-cta:active:not(:disabled){transform:scale(0.98)}
+    .btn-cta:disabled{background:var(--bg-tertiary);color:var(--content-tertiary);cursor:not-allowed}
+    .btn-cta-sub{font-size:11px;font-weight:400;opacity:0.65}
+    .stats-bar{display:grid;grid-template-columns:repeat(3,1fr);gap:var(--space-s)}
+    .stat-card{background:var(--bg-primary);border:1px solid var(--border-subtle);border-radius:var(--radius-m);padding:var(--space-m);box-shadow:var(--shadow-xs)}
+    .stat-value{font-family:var(--yds-font-display);font-size:28px;font-weight:600;line-height:1.1;letter-spacing:-0.01em;color:var(--content-primary)}
+    .stat-value.brand{color:var(--content-brand)}
+    .stat-label{font-size:12px;color:var(--content-secondary);margin-top:2px}
+    .controls-bar{background:var(--bg-primary);border:1px solid var(--border-subtle);border-radius:var(--radius-m);padding:var(--space-m) var(--space-l);display:flex;align-items:flex-end;gap:var(--space-m);box-shadow:var(--shadow-xs);flex-wrap:wrap}
+    .controls-bar .field{flex:1;min-width:200px}
+    .toggle-wrap{display:flex;flex-direction:column;gap:6px}
+    .toggle-btn{display:inline-flex;align-items:center;gap:var(--space-xs);padding:10px var(--space-m);border:1px solid var(--border-default);border-radius:var(--radius-m);background:var(--bg-primary);cursor:pointer;transition:all 150ms var(--ease)}
+    .toggle-track{width:34px;height:18px;border-radius:999px;background:var(--yds-grey-330);position:relative;transition:background 150ms var(--ease);flex-shrink:0}
+    .toggle-thumb{position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:white;box-shadow:var(--shadow-xs);transition:transform 150ms var(--ease)}
+    .toggle-btn.on .toggle-track{background:var(--yds-blue-540)}
+    .toggle-btn.on .toggle-thumb{transform:translateX(16px)}
+    .toggle-label{font-size:13px;font-weight:500;color:var(--content-secondary)}
+    .toggle-btn.on .toggle-label{color:var(--content-brand)}
+    .table-card{background:var(--bg-primary);border:1px solid var(--border-subtle);border-radius:var(--radius-m);box-shadow:var(--shadow-xs);overflow:hidden;display:flex;flex-direction:column;min-height:520px}
+    .table-wrap{overflow-x:auto;flex:1}
+    table{width:100%;border-collapse:collapse;font-size:14px}
+    thead tr{background:var(--bg-secondary)}
+    thead th{padding:var(--space-s) var(--space-l);text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:var(--content-secondary);border-bottom:1px solid var(--border-default);white-space:nowrap}
+    tbody tr{border-bottom:1px solid var(--border-subtle);transition:background 100ms}
+    tbody tr:last-child{border-bottom:none}
+    tbody tr:hover{background:var(--bg-secondary)}
+    tbody td{padding:12px var(--space-l);color:var(--content-primary)}
+    .td-price{text-align:right;font-family:var(--yds-font-mono);font-weight:500;color:var(--content-primary)}
+    .td-code{font-family:var(--yds-font-mono);font-size:12px;color:var(--content-secondary)}
+    .td-cat{color:var(--content-secondary);font-size:13px}
+    .td-var{font-size:12px;color:var(--content-secondary)}
+    .badge{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:600}
+    .badge-dot{width:5px;height:5px;border-radius:50%;background:currentColor;opacity:0.8}
+    .badge-brand{background:var(--yds-blue-40);color:var(--yds-blue-690)}
+    .badge-neutral{background:var(--bg-tertiary);color:var(--content-secondary)}
+    .badge-success{background:var(--yds-green-40);color:var(--yds-green-690)}
+    .badge-warn{background:var(--yds-yellow-40);color:var(--yds-yellow-690)}
+    .badge-error{background:var(--yds-red-40);color:var(--yds-red-690)}
+
+    /* ── Duplicate Banner ────────────────────────────── */
+    .dup-banner{background:var(--yds-orange-40);border:1px solid var(--yds-orange-540);border-radius:var(--radius-m);padding:var(--space-s) var(--space-m);display:flex;align-items:flex-start;gap:var(--space-s)}
+    .dup-icon{width:18px;height:18px;flex-shrink:0;color:var(--yds-orange-540);margin-top:1px}
+    .dup-body{flex:1;font-size:13px;color:var(--yds-grey-870)}
+    .dup-body strong{font-weight:600}
+    .dup-actions{display:flex;gap:var(--space-xs);flex-shrink:0;align-items:center}
+    .dup-list{margin-top:var(--space-xs);font-size:12px;color:var(--yds-grey-690);display:flex;flex-wrap:wrap;gap:4px}
+    .dup-tag{background:rgba(241,90,40,0.12);border:1px solid rgba(241,90,40,0.3);border-radius:var(--radius-pill);padding:2px 8px;font-size:11px;font-weight:500;color:var(--yds-orange-540);cursor:pointer;transition:background 150ms var(--ease)}
+    .dup-tag:hover{background:rgba(241,90,40,0.2)}
+
+    /* ── Verification Panel ──────────────────────────── */
+    .verify-panel{background:var(--bg-primary);border:1px solid var(--border-subtle);border-radius:var(--radius-m);box-shadow:var(--shadow-xs);overflow:hidden}
+    .verify-header{display:flex;align-items:center;justify-content:space-between;padding:var(--space-m) var(--space-l);background:var(--bg-secondary);cursor:pointer;user-select:none;transition:background 150ms var(--ease)}
+    .verify-header:hover{background:var(--bg-tertiary)}
+    .verify-title-row{display:flex;align-items:center;gap:var(--space-s)}
+    .verify-chevron{width:16px;height:16px;color:var(--content-tertiary);transition:transform 200ms var(--ease);flex-shrink:0}
+    .verify-chevron.open{transform:rotate(180deg)}
+    .verify-body{display:none}
+    .verify-body.open{display:block}
+    .verify-status-badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:var(--radius-pill);font-size:11px;font-weight:600}
+    .vsb-ok{background:var(--yds-green-40);color:var(--yds-green-690)}
+    .vsb-warn{background:var(--yds-yellow-40);color:var(--yds-yellow-690)}
+    .vsb-err{background:var(--yds-red-40);color:var(--yds-red-690)}
+    .verify-score{width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;flex-shrink:0}
+    .verify-score.pass{background:var(--yds-green-40);color:var(--yds-green-690)}
+    .verify-score.warn{background:var(--yds-yellow-40);color:var(--yds-yellow-690)}
+    .verify-score.fail{background:var(--yds-red-40);color:var(--yds-red-690)}
+    .verify-rules{display:flex;flex-direction:column}
+    .verify-rule{display:flex;align-items:center;justify-content:space-between;padding:12px var(--space-l);border-bottom:1px solid var(--border-subtle);gap:var(--space-m)}
+    .verify-rule:last-child{border-bottom:none}
+    .verify-rule-left{display:flex;align-items:center;gap:var(--space-s);flex:1;min-width:0}
+    .vr-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+    .vr-dot.ok{background:var(--yds-green-540)}
+    .vr-dot.warn{background:var(--yds-yellow-540)}
+    .vr-dot.err{background:var(--yds-red-540)}
+    .vr-name{font-size:13px;color:var(--content-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .vr-detail{font-size:12px;color:var(--content-secondary);white-space:nowrap}
+    .vr-filter{font-size:11px;font-weight:600;color:var(--yds-blue-540);background:var(--yds-blue-40);border:none;border-radius:var(--radius-pill);padding:3px 10px;cursor:pointer;white-space:nowrap;transition:background 150ms var(--ease)}
+    .vr-filter:hover{background:var(--yds-blue-90)}
+    .verify-footer{padding:var(--space-m) var(--space-l);border-top:1px solid var(--border-subtle);background:var(--bg-secondary);display:flex;align-items:center;justify-content:space-between;gap:var(--space-m)}
+    .verify-msg{font-size:13px;color:var(--content-secondary)}
+    .verify-msg.has-errors{color:var(--yds-red-690);font-weight:500}
+
+    .pagination{display:flex;align-items:center;justify-content:space-between;padding:var(--space-m) var(--space-l);border-top:1px solid var(--border-subtle);background:var(--bg-secondary);flex-wrap:wrap;gap:var(--space-s)}
+    .pagination-info{font-size:13px;color:var(--content-secondary)}
+    .pagination-controls{display:flex;align-items:center;gap:var(--space-xs)}
+    .page-select{font-family:var(--yds-font-sans);font-size:13px;padding:6px 10px;border-radius:var(--radius-s);border:1px solid var(--border-default);background:var(--bg-primary);color:var(--content-primary);outline:none;cursor:pointer}
+    .page-select:focus{border-color:var(--border-focus)}
+    .empty-state{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:var(--space-xxxl) var(--space-l);text-align:center;color:var(--content-tertiary)}
+    .empty-icon{width:52px;height:52px;background:var(--bg-secondary);border-radius:var(--radius-m);display:flex;align-items:center;justify-content:center;margin-bottom:var(--space-m);color:var(--content-tertiary)}
+    .empty-title{font-size:17px;font-weight:600;color:var(--content-secondary);margin-bottom:var(--space-xs)}
+    .empty-sub{font-size:13px;color:var(--content-tertiary)}
+    .status{padding:var(--space-s) var(--space-m);border-radius:var(--radius-s);font-size:13px;font-weight:500;border:1px solid}
+    .status-info{background:var(--bg-info);color:var(--yds-blue-690);border-color:var(--yds-blue-170)}
+    .status-success{background:var(--yds-green-40);color:var(--yds-green-690);border-color:var(--yds-green-540)}
+    .status-error{background:var(--yds-red-40);color:var(--yds-red-690);border-color:var(--yds-red-540)}
+    .modal-overlay{display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,0.4);backdrop-filter:blur(2px);align-items:center;justify-content:center;padding:var(--space-m)}
+    .modal-overlay.open{display:flex}
+    .modal{background:var(--bg-primary);border-radius:var(--radius-l);padding:var(--space-xl);max-width:400px;width:100%;box-shadow:var(--shadow-lg)}
+    .modal h2{font-family:var(--yds-font-display);font-size:28px;font-weight:600;text-align:center;margin-bottom:var(--space-xs)}
+    .modal p{text-align:center;color:var(--content-secondary);font-size:14px;line-height:1.5;margin-bottom:var(--space-xl)}
+    .modal-actions{display:flex;flex-direction:column;gap:var(--space-s)}
+    /* Error fix modal */
+    .fix-modal{max-width:680px;padding:0;overflow:hidden}
+    .fix-modal-header{padding:var(--space-l) var(--space-xl);border-bottom:1px solid var(--border-subtle);background:var(--bg-secondary)}
+    .fix-modal-header h2{font-family:var(--yds-font-display);font-size:22px;font-weight:600;margin-bottom:4px;text-align:left}
+    .fix-modal-header p{color:var(--content-secondary);font-size:13px;margin:0;text-align:left}
+    .fix-modal-list{max-height:400px;overflow-y:auto;padding:var(--space-m) var(--space-xl);display:flex;flex-direction:column;gap:var(--space-s)}
+    .fix-modal-row{background:var(--bg-secondary);border:1px solid var(--border-default);border-radius:var(--radius-m);padding:var(--space-m);display:flex;flex-direction:column;gap:var(--space-s)}
+    .fix-modal-row.resolved{opacity:0.45;pointer-events:none}
+    .fix-modal-row.resolved .fix-modal-name::after{content:' ✓';color:var(--yds-green-540);font-weight:600}
+    .fix-modal-name{font-size:13px;font-weight:600;color:var(--content-primary)}
+    .fix-modal-issue{font-size:11px;color:var(--content-secondary);display:flex;align-items:center;gap:var(--space-xs)}
+    .fix-modal-field{display:flex;align-items:center;gap:var(--space-s)}
+    .fix-modal-label{font-size:11px;font-weight:500;color:var(--content-secondary);white-space:nowrap;min-width:80px}
+    .fix-modal-input{flex:1;font-family:var(--yds-font-sans);font-size:13px;padding:8px var(--space-s);border-radius:var(--radius-s);border:1px solid var(--border-default);background:var(--bg-primary);color:var(--content-primary);outline:none}
+    .fix-modal-input:focus{border-color:var(--border-focus);box-shadow:0 0 0 2px var(--yds-blue-90)}
+    .btn-fix-apply{padding:6px 14px;border-radius:var(--radius-pill);border:none;background:var(--yds-grey-870);color:white;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;transition:all 150ms var(--ease)}
+    .btn-fix-apply:hover{background:var(--yds-grey-780)}
+    .fix-modal-footer{padding:var(--space-m) var(--space-xl);border-top:1px solid var(--border-subtle);display:flex;gap:var(--space-s);background:var(--bg-secondary);align-items:center}
+    .fix-modal-progress{font-size:12px;color:var(--content-secondary);margin-right:auto}
+
+    /* Case price review modal */
+    .case-modal{max-width:640px;padding:0;overflow:hidden}
+    .case-modal-header{padding:var(--space-l) var(--space-xl);border-bottom:1px solid var(--border-subtle);background:var(--bg-secondary)}
+    .case-modal-header h2{font-family:var(--yds-font-display);font-size:22px;font-weight:600;margin-bottom:4px;text-align:left}
+    .case-modal-header p{color:var(--content-secondary);font-size:13px;margin:0;text-align:left}
+    .case-modal-list{max-height:360px;overflow-y:auto;padding:var(--space-m) var(--space-xl);display:flex;flex-direction:column;gap:var(--space-s)}
+    .case-modal-row{background:var(--bg-secondary);border:1px solid var(--border-subtle);border-radius:var(--radius-m);padding:var(--space-m)}
+    .case-modal-row.resolved{opacity:0.5;border-color:var(--border-subtle)}
+    .case-modal-name{font-size:14px;font-weight:600;color:var(--content-primary);margin-bottom:var(--space-xs)}
+    .case-modal-detail{font-size:12px;color:var(--content-secondary);margin-bottom:var(--space-s)}
+    .case-modal-actions{display:flex;align-items:center;gap:var(--space-xs)}
+    .case-modal-price{font-family:var(--yds-font-mono);font-size:13px;font-weight:600;margin-right:auto}
+    .case-modal-price.suggested{color:var(--yds-green-690)}
+    .case-modal-price.original{color:var(--content-secondary);text-decoration:line-through}
+    .case-modal-footer{padding:var(--space-m) var(--space-xl);border-top:1px solid var(--border-subtle);display:flex;gap:var(--space-s);background:var(--bg-secondary)}
+    .case-modal-progress{font-size:12px;color:var(--content-secondary);padding:var(--space-xs) var(--space-xl);text-align:center}
+    .loader{width:18px;height:18px;border-radius:50%;border:2.5px solid rgba(255,255,255,0.3);border-top-color:#fff;animation:spin 0.7s linear infinite;display:inline-block;flex-shrink:0}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .hidden{display:none!important}
+    /* flag rows */
+    tbody tr.row-warn td:first-child{border-left:3px solid var(--yds-yellow-540)}
+    tbody tr.row-error td:first-child{border-left:3px solid var(--yds-red-540)}
+    tbody tr.row-dup td:first-child{border-left:3px solid var(--yds-orange-540)}
+    .btn-remove-row{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:var(--radius-pill);border:1px solid var(--yds-red-540);background:transparent;color:var(--yds-red-540);font-size:11px;font-weight:600;cursor:pointer;transition:all 150ms var(--ease);white-space:nowrap}
+    .btn-remove-row:hover{background:var(--yds-red-40)}
+    .case-price-cell{display:flex;flex-direction:column;gap:4px}
+    .case-price-suggestion{display:flex;align-items:center;gap:6px;padding:4px 8px;background:var(--yds-yellow-40);border:1px solid var(--yds-yellow-170);border-radius:var(--radius-s)}
+    .case-price-label{font-size:11px;color:var(--yds-yellow-690);font-weight:500}
+    .case-price-value{font-size:11px;font-weight:700;color:var(--content-primary);font-family:var(--yds-font-mono)}
+    .btn-approve{display:inline-flex;align-items:center;gap:3px;padding:2px 8px;border-radius:var(--radius-pill);border:1px solid var(--yds-green-540);background:transparent;color:var(--yds-green-690);font-size:10px;font-weight:700;cursor:pointer;transition:all 150ms var(--ease);white-space:nowrap}
+    .btn-approve:hover{background:var(--yds-green-40)}
+    .btn-dismiss-case{display:inline-flex;align-items:center;gap:3px;padding:2px 8px;border-radius:var(--radius-pill);border:1px solid var(--border-default);background:transparent;color:var(--content-secondary);font-size:10px;font-weight:700;cursor:pointer;transition:all 150ms var(--ease);white-space:nowrap}
+    .btn-dismiss-case:hover{background:var(--bg-tertiary)}
+    tbody tr.row-case td:first-child{border-left:3px solid var(--yds-yellow-540)}
+    .case-approved{display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--yds-green-690);font-weight:600}
   </style>
 </head>
 <body>
-  <div class="card">
-    <h1>Yoco Retail Import Processor</h1>
-    <p>Upload a supplier Excel/CSV file and download a Yoco-ready workbook with an Issues tab.</p>
-    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" />
-    <button id="processButton">Process file</button>
-    <div id="status"></div>
+
+  <nav class="top-bar">
+    <div class="top-bar-inner">
+      <div class="top-bar-left">
+        <svg class="yoco-wordmark" viewBox="0 0 567 137" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Yoco">
+          <path fill="var(--content-primary)" d="M52.908 94.454L0 4.728h50.608l25.043 45.642h1.582L102.458 4.69h49.55L99.099 94.454v37.679H52.86l.048-37.679ZM138.616 68.437C138.616 25.848 166.822 0 211.626 0s73.011 25.848 73.011 68.437-28.219 68.425-73.011 68.425-73.01-25.835-73.01-68.425Zm101 0c0-18.752-10.588-29.49-27.989-29.49s-27.865 10.738-27.865 29.49 10.404 29.477 27.865 29.477 28.024-10.738 28.024-29.477h-.036ZM292.018 68.796c0-42.59 29.449-67.709 73.011-67.709 21.343 0 36.323 5.275 48.138 12.195v42.954h-.354c-14.455-10.048-26.976-15.838-42.491-15.838-18.691 0-32.089 10.048-32.089 28.033 0 18.563 13.75 27.845 31.906 27.845 16.05 0 28.925-5.639 42.674-16.013h.354v43.494c-9.736 5.827-26.771 12.007-48.491 12.007-44.987.013-72.658-24.378-72.658-66.968ZM420.909 68.437C420.909 25.848 449.115 0 493.919 0s73.01 25.848 73.01 68.437-28.206 68.425-73.01 68.425-73.01-25.835-73.01-68.425Zm101 0c0-18.752-10.574-29.49-27.987-29.49s-27.853 10.738-27.853 29.49 10.404 29.477 27.853 29.477 28.024-10.738 28.024-29.477h-.037Z"/>
+        </svg>
+        <div class="divider"></div>
+        <span class="app-name">RetailScan AI</span>
+      </div>
+      <button id="clearAllBtn" class="btn btn-ghost btn-sm">Clear all</button>
+    </div>
+  </nav>
+
+  <div class="page">
+    <div style="margin-bottom:var(--space-xl)">
+      <h1>Import your product catalogue</h1>
+      <p style="color:var(--content-secondary);margin-top:var(--space-xs);font-size:17px;max-width:600px;">Upload a retail price list — image, PDF, or spreadsheet — and export a Yoco-ready XLSX instantly.</p>
+    </div>
+
+    <div class="two-col">
+      <!-- LEFT -->
+      <div class="left-col">
+
+        <div class="card">
+          <div class="field">
+            <label class="field-label" for="clientNameInput">Store name</label>
+            <input class="input" type="text" id="clientNameInput" placeholder="e.g. Themba's General Store">
+            <span class="field-hint">Re-enter a previous store name to reload its data</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header"><h3>Parse mode</h3></div>
+          <div class="tab-group" style="position:relative">
+            <div class="tab-wrap">
+              <button class="tab" id="tabSingle" data-mode="single">Single items</button>
+              <div class="tab-tooltip">Each product line becomes <strong>one row</strong>. Sizes stay in the name as written. Best for simple price lists.</div>
+            </div>
+            <div class="tab-wrap">
+              <button class="tab active" id="tabVariant" data-mode="variant">With variants</button>
+              <div class="tab-tooltip">Products with the same base name but different sizes are <strong>grouped</strong> with a Size attribute — e.g. Milk 1L &amp; 500ml become one product with two variant rows.</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3>AI instructions</h3>
+            <button id="clearInstructionsBtn" class="btn btn-ghost btn-sm" style="color:var(--content-critical);border-color:var(--yds-red-540)">Reset</button>
+          </div>
+          <div class="chip-group" style="margin-bottom:var(--space-m)">
+            <button class="chip active" data-instruction="barcodes" data-text="Identify and extract any barcodes, SKU codes, PLU codes or product codes and assign them to each item's barcode field.">Barcodes / SKU</button>
+            <button class="chip active" data-instruction="categories" data-text="MANDATORY: Assign a meaningful category to every product. Infer from product type, brand, or context (e.g. Dairy, Bakery, Cleaning, Beverages, Spices, Personal Care, Stationery, Snacks, Canned Goods, Household). NEVER use Uncategorised — always make your best inference.">Categories</button>
+            <button class="chip" data-instruction="zero-prices" data-text="If a price cannot be determined for an item, set selling_price to 0.">Zero missing prices</button>
+            <button class="chip" data-instruction="clean-names" data-text="Clean product names: capitalise properly, remove duplicate size references if a variant attribute already captures the size.">Clean names</button>
+            <button class="chip active" data-instruction="vat" data-text="All prices are VAT-inclusive. Set VAT Enabled to Yes for all items.">VAT inclusive</button>
+          </div>
+          <div class="chat-container" style="margin-bottom:var(--space-s)">
+            <div class="chat-messages" id="chatMessages">
+              <div class="chat-bubble assistant">
+                <span class="bubble-label">Assistant</span>
+                Active: <strong>Barcodes/SKU</strong>, <strong>Categories</strong>, <strong>VAT inclusive</strong>. Add custom instructions below.
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;gap:var(--space-xs)">
+            <input class="input" type="text" id="chatInput" placeholder="e.g. Ignore cleaning products…" style="flex:1;font-size:13px;padding:10px var(--space-m)">
+            <button id="chatSendBtn" class="btn btn-primary btn-sm">Send</button>
+          </div>
+          <textarea id="aiNotesInput" class="hidden"></textarea>
+        </div>
+
+        <div id="dropZone" class="drop-zone">
+          <input type="file" id="fileInput" class="hidden" accept="image/*,application/pdf,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" multiple>
+          <div class="drop-icon">
+            <svg width="22" height="22" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>
+          </div>
+          <p style="font-weight:600;margin:0;font-size:15px">Upload price list</p>
+          <p style="font-size:12px;color:var(--content-secondary);margin:0">Images · PDF · CSV · Excel</p>
+        </div>
+
+        <div id="filesList" class="file-list hidden"></div>
+
+        <button id="processBtn" class="btn-cta hidden">
+          <div style="display:flex;align-items:center;gap:var(--space-s)">
+            <span id="btnText">Scan &amp; extract</span>
+            <div id="btnLoader" class="loader hidden"></div>
+          </div>
+          <span class="btn-cta-sub" id="fileCountText">No files uploaded</span>
+        </button>
+
+        <div id="statusMessage" class="hidden"></div>
+      </div>
+
+      <!-- RIGHT -->
+      <div class="right-col">
+
+        <div id="statsBar" class="stats-bar hidden">
+          <div class="stat-card">
+            <div class="stat-value brand" id="statTotal">0</div>
+            <div class="stat-label label-caps">Total rows</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="statVariants">0</div>
+            <div class="stat-label label-caps">Variant rows</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="statCategories">0</div>
+            <div class="stat-label label-caps">Categories</div>
+          </div>
+        </div>
+
+        <!-- Duplicate banner (shown when dupes found) -->
+        <div id="dupBanner" class="dup-banner hidden">
+          <svg class="dup-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+          <div class="dup-body">
+            <strong id="dupCount">0 duplicate product names</strong> detected — these may cause import issues in Yoco. Review and rename before exporting.
+            <div class="dup-list" id="dupList"></div>
+          </div>
+          <div class="dup-actions">
+            <button id="dupDismiss" class="btn btn-ghost btn-sm">Dismiss</button>
+          </div>
+        </div>
+
+        <!-- Verification panel (shown after scan) -->
+        <div id="verifyPanel" class="verify-panel hidden">
+          <div class="verify-header" id="verifyToggle">
+            <div class="verify-title-row">
+              <div class="verify-score" id="verifyScore">—</div>
+              <div>
+                <h3 style="margin:0">Data verification</h3>
+                <p style="font-size:12px;color:var(--content-secondary);margin:0" id="verifySubtitle">Checking against Yoco upload standards</p>
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:var(--space-s)">
+              <span class="verify-status-badge vsb-ok hidden" id="verifyBadge"></span>
+              <button id="rerunVerify" class="btn btn-ghost btn-sm" onclick="event.stopPropagation()">Re-run</button>
+              <svg class="verify-chevron" id="verifyChevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4,6 8,10 12,6"/></svg>
+            </div>
+          </div>
+          <div class="verify-body" id="verifyBody">
+            <div class="verify-rules" id="verifyRules"></div>
+            <div class="verify-footer">
+              <span class="verify-msg" id="verifyFooterMsg"></span>
+              <button id="verifyExportBtn" class="btn btn-brand btn-sm">Export to Yoco (.xlsx)</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="controlsBar" class="controls-bar hidden">
+          <div class="field">
+            <label class="field-label" for="masterFilter">Search products</label>
+            <input class="input" type="text" id="masterFilter" placeholder="Filter by name or category…" style="font-size:13px;padding:10px var(--space-m)">
+          </div>
+          <div class="toggle-wrap">
+            <span class="field-label">Track stock</span>
+            <button id="trackStockToggle" class="toggle-btn on" aria-pressed="true">
+              <span class="toggle-track"><span class="toggle-thumb"></span></span>
+              <span class="toggle-label" id="trackStockLabel">On</span>
+            </button>
+          </div>
+          <button id="excelBtn" class="btn btn-ghost btn-sm" style="align-self:flex-end" onclick="document.getElementById('verifyPanel').classList.remove('hidden');document.getElementById('verifyBody').classList.add('open');document.getElementById('verifyChevron').classList.add('open');document.getElementById('verifyPanel').scrollIntoView({behavior:'smooth'})">View verification &amp; export</button>
+        </div>
+
+        <div class="table-card">
+          <div class="table-wrap">
+            <table id="resultsTable" class="hidden">
+              <thead>
+                <tr>
+                  <th>Category</th>
+                  <th>Product name</th>
+                  <th>Type</th>
+                  <th>Variant / size</th>
+                  <th style="text-align:right">Price</th>
+                  <th>Issues</th>
+                </tr>
+              </thead>
+              <tbody id="tableBody"></tbody>
+            </table>
+            <div id="emptyState" class="empty-state">
+              <div class="empty-icon">
+                <svg width="24" height="24" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
+              </div>
+              <div class="empty-title">Ready to scan</div>
+              <div class="empty-sub">Upload a retail price list to get started</div>
+            </div>
+
+            <!-- Scan progress — lives in the right panel, replaces empty state -->
+            <div id="scanState" class="scan-state hidden">
+              <div class="scan-ring-wrap">
+                <svg width="96" height="96" viewBox="0 0 96 96">
+                  <circle class="scan-ring-bg" cx="48" cy="48" r="40"/>
+                  <circle class="scan-ring-fill" id="scanRingFill" cx="48" cy="48" r="40"/>
+                </svg>
+                <div class="scan-counter-wrap">
+                  <span class="scan-counter-num" id="scanNum">0</span>
+                  <span class="scan-counter-total" id="scanTotal">of 0</span>
+                </div>
+              </div>
+              <div>
+                <div class="scan-label" id="scanLabel">Scanning…</div>
+                <div class="scan-filename" id="scanFilename"></div>
+              </div>
+              <div class="scan-file-list" id="scanPills"></div>
+            </div>
+          </div>
+          <div id="paginationControls" class="pagination hidden">
+            <span class="pagination-info" id="pageIndicator">Page 1 of 1</span>
+            <div class="pagination-controls">
+              <span class="field-label" style="font-size:12px">Rows:</span>
+              <select id="rowsPerPageSelect" class="page-select">
+                <option value="25">25</option><option value="50">50</option>
+                <option value="100">100</option><option value="200">200</option>
+              </select>
+              <button id="prevPageBtn" class="btn btn-ghost btn-sm">Prev</button>
+              <button id="nextPageBtn" class="btn btn-ghost btn-sm">Next</button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
   </div>
 
-  <script>
-    // For local testing use: http://127.0.0.1:10000/process-retail-file
-    // After deployment, replace this with your Render URL:
-    const API_URL = "https://YOUR-RENDER-SERVICE.onrender.com/process-retail-file";
+  <!-- Export confirmation modal -->
+  <div id="warningModal" class="modal-overlay">
+    <div class="modal">
+      <h2>Final check</h2>
+      <p>AI can make mistakes — please verify all product data before importing into Yoco.</p>
+      <div class="modal-actions">
+        <button id="confirmDownload" class="btn btn-brand btn-full" style="padding:14px;font-size:15px">Verify &amp; export</button>
+        <button id="cancelDownload" class="btn btn-secondary btn-full" style="padding:14px">Go back</button>
+      </div>
+    </div>
+  </div>
 
-    document.getElementById("processButton").addEventListener("click", async () => {
-      const fileInput = document.getElementById("fileInput");
-      const status = document.getElementById("status");
+  <!-- Case price review modal — shown before export if unresolved case prices exist -->
+  <div id="casePriceModal" class="modal-overlay">
+    <div class="modal case-modal">
+      <div class="case-modal-header">
+        <h2>Review case prices before export</h2>
+        <p id="casePriceModalSubtitle">Some products have pack pricing that needs your approval.</p>
+      </div>
+      <div class="case-modal-list" id="casePriceModalList"></div>
+      <div class="case-modal-progress" id="casePriceModalProgress"></div>
+      <div class="case-modal-footer">
+        <button id="caseApproveAllBtn" class="btn btn-brand btn-sm">Approve all suggested</button>
+        <button id="caseDismissAllBtn" class="btn btn-secondary btn-sm">Keep all original</button>
+        <button id="caseProceedBtn" class="btn btn-primary btn-sm" style="margin-left:auto">Export now</button>
+        <button id="caseCancelBtn" class="btn btn-ghost btn-sm">Cancel</button>
+      </div>
+    </div>
+  </div>
 
-      if (!fileInput.files.length) {
-        status.textContent = "Please choose a file first.";
+  <!-- Error fix modal — shown when errors/warnings need resolution -->
+  <div id="fixModal" class="modal-overlay">
+    <div class="modal fix-modal">
+      <div class="fix-modal-header">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+          <h2 id="fixModalTitle" style="margin:0">Fix issues before export</h2>
+          <span id="fixModalStep" style="font-size:12px;color:var(--content-secondary);white-space:nowrap;margin-left:var(--space-m)"></span>
+        </div>
+        <div id="fixModalStepBar" style="height:3px;background:var(--bg-tertiary);border-radius:999px;margin-bottom:8px;overflow:hidden">
+          <div id="fixModalStepFill" style="height:3px;background:var(--yds-blue-540);border-radius:999px;transition:width 300ms var(--ease);width:0%"></div>
+        </div>
+        <p id="fixModalSubtitle">Review and correct each item below.</p>
+      </div>
+      <div class="fix-modal-list" id="fixModalList"></div>
+      <div class="fix-modal-footer">
+        <span class="fix-modal-progress" id="fixModalProgress"></span>
+        <button id="fixModalProceed" class="btn btn-primary btn-sm">Next →</button>
+        <button id="fixModalCancel" class="btn btn-ghost btn-sm">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+  import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+  import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey:"AIzaSyBvvPbA8b1HsUg_vjv26XtarPto2hpwy_Q",
+    authDomain:"menutool-fbdba.firebaseapp.com",
+    projectId:"menutool-fbdba",
+    storageBucket:"menutool-fbdba.firebasestorage.app",
+    messagingSenderId:"234158065758",
+    appId:"1:234158065758:web:71572249708f057c670ccf"
+  };
+  const app=initializeApp(firebaseConfig), auth=getAuth(app), db=getFirestore(app);
+  let currentUser=null;
+
+  if(typeof pdfjsLib!=='undefined') pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+
+  const init = async () => {
+    let uploadedFiles=[], masterData=[], rawItems=[], filteredData=[];
+    let currentPage=1, rowsPerPage=25, trackStockEnabled=true, parseMode='variant';
+    let currentSnapshotUnsubscribe=null;
+    const chatInstructions=[], chipStates={};
+            const apiKey = "";
+    // Render service that handles spreadsheets (XLSX/XLSM/XLS/CSV).
+    // Images and PDFs stay on the in-browser Gemini path.
+    // Point this at your Render service. If left as the placeholder and the page
+    // is being served over http(s) — e.g. from the service's own /dashboard route
+    // — the current origin is used instead, which also sidesteps CORS entirely.
+    const RENDER_API_URL_CONFIGURED = "https://YOUR-RENDER-SERVICE.onrender.com";
+    const RENDER_API_URL = (RENDER_API_URL_CONFIGURED.includes("YOUR-RENDER-SERVICE") && location.origin.startsWith("http"))
+      ? location.origin
+      : RENDER_API_URL_CONFIGURED;
+
+    // Render free instances sleep. Warm it on page load so the first Scan is not
+    // paying a ~50s cold start while the user watches a spinner.
+    fetch(RENDER_API_URL.replace(/\/$/,'')+'/health').catch(()=>{});
+    const _renderMeta = {};
+    const standardHeader=["Product ID","Product Name","Description","Default Price","Brand","Category","SKU","Default Cost Price","Ask For Quantity","Default Quantity","Quantity Units","Ask For Price","VAT Enabled","Variant Price","Variant Enabled","Attribute 1","Value 1","Attribute 2","Value 2","Attribute 3","Value 3","Image URL","Barcode","Track Stock","Modifier Group"];
+
+    try{ await signInAnonymously(auth); }catch(e){ console.warn('Firebase auth:',e); }
+    onAuthStateChanged(auth, u=>{ currentUser=u; });
+
+    // ── Mode tabs ──────────────────────────────────────────
+    document.querySelectorAll('.tab').forEach(tab=>{
+      tab.addEventListener('click',()=>{
+        if(tab.dataset.mode===parseMode) return;
+        parseMode=tab.dataset.mode;
+        document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t===tab));
+        if(rawItems.length>0){
+          masterData=[]; Object.keys(_slugCount).forEach(k=>delete _slugCount[k]);
+          rawItems.forEach(item=>expandItem(item).forEach(row=>{ row._uid=Math.random().toString(36).slice(2); masterData.push(row); }));
+          currentPage=1; renderTable(); runVerification(); runDuplicateCheck();
+          showStatus('Switched to '+parseMode+' mode — '+masterData.length+' rows.','info');
+        }
+      });
+    });
+
+    // ── Chips ──────────────────────────────────────────────
+    function initChips(){
+      document.querySelectorAll('.chip[data-instruction]').forEach(chip=>{
+        const key=chip.dataset.instruction, text=chip.dataset.text;
+        chipStates[key]=chip.classList.contains('active');
+        if(chipStates[key]) chatInstructions.push({type:'chip',key,text});
+        chip.addEventListener('click',()=>{
+          chipStates[key]=!chipStates[key];
+          chip.classList.toggle('active',chipStates[key]);
+          if(chipStates[key]){ chatInstructions.push({type:'chip',key,text}); addBubble('Enabled: '+chip.textContent.trim(),'user'); addBubble('Got it — applied during extraction.','assistant'); }
+          else{ const idx=chatInstructions.findIndex(i=>i.key===key); if(idx>-1) chatInstructions.splice(idx,1); addBubble('Disabled: '+chip.textContent.trim(),'user'); addBubble('Removed that instruction.','assistant'); }
+          syncInstructions();
+        });
+      });
+    }
+    function addBubble(text,type){ const c=document.getElementById('chatMessages'),b=document.createElement('div'); b.className='chat-bubble '+type; b.innerHTML=type==='assistant'?'<span class="bubble-label">Assistant</span>'+text:text; c.appendChild(b); c.parentElement.scrollTop=c.parentElement.scrollHeight; }
+    function syncInstructions(){ document.getElementById('aiNotesInput').value=chatInstructions.map(i=>i.text).join('\n'); }
+    document.getElementById('chatSendBtn').onclick=()=>{ const inp=document.getElementById('chatInput'),text=inp.value.trim(); if(!text) return; chatInstructions.push({type:'custom',text}); addBubble(text,'user'); addBubble('Noted — applied during extraction.','assistant'); syncInstructions(); inp.value=''; };
+    document.getElementById('chatInput').addEventListener('keydown',e=>{ if(e.key==='Enter'){e.preventDefault();document.getElementById('chatSendBtn').click();} });
+    document.getElementById('clearInstructionsBtn').onclick=()=>{ chatInstructions.length=0; document.querySelectorAll('.chip[data-instruction]').forEach(chip=>{ const key=chip.dataset.instruction,active=key==='barcodes'||key==='categories'||key==='vat'; chip.classList.toggle('active',active); chipStates[key]=active; if(active) chatInstructions.push({type:'chip',key,text:chip.dataset.text}); }); document.getElementById('chatMessages').innerHTML='<div class="chat-bubble assistant"><span class="bubble-label">Assistant</span>Instructions reset to defaults.</div>'; document.getElementById('chatInput').value=''; syncInstructions(); };
+    initChips(); syncInstructions();
+
+    // ── Clear all ──────────────────────────────────────────
+    document.getElementById('clearAllBtn').onclick=()=>{
+      uploadedFiles=[]; masterData=[]; rawItems=[]; filteredData=[]; currentPage=1;
+      Object.keys(_slugCount).forEach(k=>delete _slugCount[k]);
+      if(currentSnapshotUnsubscribe){ currentSnapshotUnsubscribe(); currentSnapshotUnsubscribe=null; }
+      ['clientNameInput','aiNotesInput','masterFilter'].forEach(id=>document.getElementById(id).value='');
+      document.getElementById('fileInput').value='';
+      document.getElementById('statusMessage').classList.add('hidden');
+      document.getElementById('verifyPanel').classList.add('hidden');
+      document.getElementById('dupBanner').classList.add('hidden');
+      document.getElementById('scanState').classList.add('hidden');
+      renderFiles(); renderTable(); updateBtn();
+    };
+
+    // ── File upload ────────────────────────────────────────
+    document.getElementById('dropZone').onclick=()=>document.getElementById('fileInput').click();
+    const dz=document.getElementById('dropZone');
+    dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('drop-zone--over');});
+    dz.addEventListener('dragleave',()=>dz.classList.remove('drop-zone--over'));
+    dz.addEventListener('drop',e=>{ e.preventDefault(); dz.classList.remove('drop-zone--over'); const dt=new DataTransfer(); Array.from(e.dataTransfer.files).forEach(f=>dt.items.add(f)); const fi=document.getElementById('fileInput'); fi.files=dt.files; fi.dispatchEvent(new Event('change')); });
+
+    document.getElementById('fileInput').onchange=async(e)=>{
+      if(!e.target.files.length) return;
+      showStatus('Reading files…','info');
+      for(let f of e.target.files){
+        const ext=f.name.split('.').pop().toLowerCase();
+        if(f.type==='application/pdf'){
+          const pdf=await pdfjsLib.getDocument({data:await f.arrayBuffer()}).promise;
+          for(let i=1;i<=pdf.numPages;i++){
+            const page=await pdf.getPage(i),canvas=document.createElement('canvas'),ctx=canvas.getContext('2d'),vp=page.getViewport({scale:2});
+            canvas.width=vp.width; canvas.height=vp.height;
+            await page.render({canvasContext:ctx,viewport:vp}).promise;
+            uploadedFiles.push({name:f.name+' (p'+i+')',base64:canvas.toDataURL('image/jpeg',0.8).split(',')[1],id:Math.random(),type:'image'});
+          }
+        } else if(f.type.startsWith('image/')){
+          const reader=new FileReader(), b64=await new Promise(r=>{reader.onload=ev=>r(ev.target.result);reader.readAsDataURL(f);});
+          uploadedFiles.push({name:f.name,base64:b64.split(',')[1],id:Math.random(),type:'image'});
+        } else if(['xlsx','xlsm','xls','csv'].includes(ext)){
+          // Spreadsheets are sent whole to the Render service — ONE request per
+          // workbook instead of one Gemini call per sheet. The service samples the
+          // layout, gets a plan from Gemini, then executes it in Python at full scale.
+          let sheetLabel='';
+          try{
+            if(ext!=='csv'){
+              const wb=XLSX.read(await f.arrayBuffer(),{type:'array'});
+              sheetLabel=wb.SheetNames.length>1?wb.SheetNames.length+' sheets':'1 sheet';
+            } else { sheetLabel='CSV'; }
+          }catch(e){ sheetLabel=''; }
+          uploadedFiles.push({
+            name:f.name,
+            file:f,              // original File object — posted as multipart
+            ext,
+            sheetLabel,
+            type:'render',
+            id:Math.random()
+          });
+        }
+      }
+      renderFiles();
+      showStatus(uploadedFiles.length+' file(s) ready.','info');
+    };
+
+    function renderFiles(){
+      const list=document.getElementById('filesList'); list.innerHTML=''; list.classList.toggle('hidden',!uploadedFiles.length);
+      uploadedFiles.forEach(f=>{ const d=document.createElement('div'); d.className='file-item'; d.innerHTML='<span>'+f.name+'</span><button class="file-remove">\xd7</button>'; d.querySelector('button').onclick=()=>{uploadedFiles=uploadedFiles.filter(x=>x.id!==f.id);renderFiles();updateBtn();}; list.appendChild(d); });
+      document.getElementById('fileCountText').textContent=uploadedFiles.length?uploadedFiles.length+' file(s) ready':'No files uploaded';
+      updateBtn();
+    }
+    function updateBtn(){ const ok=uploadedFiles.length>0&&document.getElementById('clientNameInput').value.trim().length>0; document.getElementById('processBtn').classList.toggle('hidden',!ok); }
+    document.getElementById('clientNameInput').oninput=updateBtn;
+
+    // ── Firebase save / load ───────────────────────────────
+    // Strip undefined values recursively — Firestore rejects them
+    function sanitise(val){
+      if(val===null||val===undefined) return '';
+      if(Array.isArray(val)) return val.map(sanitise);
+      if(typeof val==='object') return Object.fromEntries(Object.entries(val).map(([k,v])=>[k,sanitise(v)]));
+      return val;
+    }
+
+    const saveToFirestore=async()=>{
+      if(!currentUser) return;
+      const clientName=document.getElementById('clientNameInput').value.trim(); if(!clientName) return;
+      try{
+        await setDoc(doc(db,'retail_extractions',clientName), sanitise({
+          clientName, industry:'retail', parseMode,
+          rawItems, masterData,
+          aiNotes:document.getElementById('aiNotesInput').value.trim(),
+          timestamp:new Date().toISOString()
+        }),{merge:true});
+      }
+      catch(e){ console.error('Firestore save failed:',e); }
+    };
+    const loadClientData=()=>{
+      if(!currentUser) return;
+      const clientName=document.getElementById('clientNameInput').value.trim(); if(!clientName) return;
+      if(currentSnapshotUnsubscribe) currentSnapshotUnsubscribe();
+      currentSnapshotUnsubscribe=onSnapshot(doc(db,'retail_extractions',clientName),snapshot=>{
+        if(!snapshot.exists()) return;
+        const data=snapshot.data(); rawItems=data.rawItems||[]; masterData=data.masterData||[];
+        if(rawItems.length>0){ masterData=[]; Object.keys(_slugCount).forEach(k=>delete _slugCount[k]); const savedMode=data.parseMode||parseMode; rawItems.forEach(item=>expandItem(item,savedMode).forEach(row=>{ row._uid=Math.random().toString(36).slice(2); masterData.push(row); })); }
+        if(data.aiNotes&&!document.getElementById('aiNotesInput').value.trim()) document.getElementById('aiNotesInput').value=data.aiNotes;
+        if(masterData.length>0){ currentPage=1; renderTable(); runVerification(); runDuplicateCheck(); showStatus('Loaded '+masterData.length+' saved rows for "'+clientName+'".','info'); }
+      },e=>console.error('Firestore listen error:',e));
+    };
+    document.getElementById('clientNameInput').addEventListener('blur',loadClientData);
+
+    // ── Helpers ────────────────────────────────────────────
+    function slugify(n){ return(n||'').toString().toLowerCase().trim().replace(/&/g,'-').replace(/\//g,'-').replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,''); }
+
+    const _slugCount={};
+
+    function expandItem(item, forcedMode){
+      // forcedMode lets firebase reload / mode-switch pass the intended mode explicitly
+      // so we never accidentally read a stale parseMode variable
+      const mode = forcedMode || parseMode;
+
+      // Rows from the Render service are already one-row-per-variant with
+      // attr1..3 populated. Re-expanding them would strip the variant grouping,
+      // so pass them straight through (or flatten them for single mode).
+      if(item._fromRender){
+        if(mode==='single' && item.variant_enabled==='Yes'){
+          const label=[item.attr1_val,item.attr2_val,item.attr3_val].filter(Boolean).join(' ');
+          const nm=(item.product_name||'')+(label?' '+label:'');
+          const base=slugify(nm);
+          let pid=base;
+          if(_slugCount[base]){ _slugCount[base]++; pid=base+'-'+_slugCount[base]; } else { _slugCount[base]=1; }
+          return[{...item,product_name:nm,product_id:pid,variant_enabled:'No',attr1_name:'',attr1_val:'',attr2_name:'',attr2_val:'',attr3_name:'',attr3_val:''}];
+        }
+        return[{...item}];
+      }
+
+      const attrs=(item.attributes||[]).filter(a=>(a.values||[]).length>0); // ignore attrs with empty values
+      const baseSlug=slugify(item.product_name);
+
+      if(!attrs.length || mode==='single'){
+        // Single item — enforce unique product_id with -2, -3 suffix on collision
+        let pid=baseSlug;
+        if(_slugCount[baseSlug]){ _slugCount[baseSlug]++; pid=baseSlug+'-'+_slugCount[baseSlug]; }
+        else { _slugCount[baseSlug]=1; }
+        return[{...item,product_id:pid,calculated_price:item.selling_price,variant_enabled:'No',attr1_name:'',attr1_val:'',attr2_name:'',attr2_val:'',attr3_name:'',attr3_val:''}];
+      }
+
+      // Variant product — all rows intentionally share the same base slug
+      let combos=[[]];
+      attrs.slice(0,3).forEach(a=>{
+        const next=[];
+        (a.values||[]).forEach(v=>{
+          // Safely parse price_adjustment — null/undefined/NaN all become 0
+          const adj=isNaN(parseFloat(v.price_adjustment)) ? 0 : parseFloat(v.price_adjustment);
+          combos.forEach(c=>next.push([...c,{name:a.name,val:v.label||'',adj}]));
+        });
+        if(next.length) combos=next;
+      });
+
+      // Safety: if combos somehow still [[]] after filtering, fall back to single
+      if(combos.length===1 && combos[0].length===0){
+        let pid=baseSlug;
+        if(_slugCount[baseSlug]){ _slugCount[baseSlug]++; pid=baseSlug+'-'+_slugCount[baseSlug]; }
+        else { _slugCount[baseSlug]=1; }
+        return[{...item,product_id:pid,calculated_price:item.selling_price,variant_enabled:'No',attr1_name:'',attr1_val:'',attr2_name:'',attr2_val:'',attr3_name:'',attr3_val:''}];
+      }
+
+      return combos.map(c=>{
+        const row={...item,product_id:baseSlug,variant_enabled:'Yes',attr1_name:'',attr1_val:'',attr2_name:'',attr2_val:'',attr3_name:'',attr3_val:''};
+        let price=parseFloat(item.selling_price||0);
+        c.forEach((x,idx)=>{
+          row['attr'+(idx+1)+'_name']=x.name;
+          row['attr'+(idx+1)+'_val']=x.val;
+          price += isNaN(x.adj) ? 0 : x.adj;
+        });
+        row.calculated_price=Math.round(price*100)/100; // avoid floating point drift
+        return row;
+      });
+    }
+
+    // Module-level API call tracker — persists across all files for accurate rate limiting
+    let _lastApiCall=Date.now()-10000; // allow immediate first call
+
+    // ── Pack qty detection — checks sources the AI might use ────────────────
+    // IMPORTANT: must not false-positive on volume sizes like "440ml", "660ml"
+    // Defined at module level — strict mode (ES module) forbids fn declarations in blocks
+    function _extractPackQty(item){
+      // Source 1: product name — explicit "x N" AFTER the product name
+      // e.g. "Gordons 200ml x 12", "Coke 440ml x 24", "Gordons 50ml x12"
+      // The x must be preceded by a non-digit (space or letter) to avoid matching
+      // volume numbers going the wrong way
+      let m=(item.product_name||'').match(/(?<![0-9])x\s*(\d+)(?:\s*(?:pack|pcs|units?))?/i);
+      if(m && parseInt(m[1])>=6) return parseInt(m[1]);
+
+      // Source 2: bracket notation — ONLY when "pack", "pcs", "units" or "x" is explicit
+      // e.g. "(Pack of 12)", "(24 pack)", "(24x)" — NOT "(440ml)" or "(750ml)"
+      m=(item.product_name||'').match(/\((?:pack\s+of\s+)?(\d+)\s*(?:pack|pcs|units?|x)\)/i);
+      if(m && parseInt(m[1])>=6) return parseInt(m[1]);
+
+      // Source 3 REMOVED — "24x Gordons" format too risky, false positives on volume sizes
+
+      // Source 4: attribute whose NAME contains pack/qty/count/units (NOT Size/Colour/etc)
+      // e.g. attribute name "Pack Size" with label "x 12" or "12"
+      const attrs=item.attributes||[];
+      const packAttr=attrs.find(a=>{
+        const n=(a.name||'').toLowerCase();
+        return n.includes('pack')||n.includes('qty')||n.includes('count')||n.includes('units');
+      });
+      if(packAttr){
+        for(const v of (packAttr.values||[])){
+          // Only match if label looks like a count (x12, x 12, 12) — not a volume (440ml, 1L)
+          const lm=(v.label||'').match(/^x?\s*(\d+)\s*(?:pack|pcs|units?)?$/i);
+          if(lm && parseInt(lm[1])>=6) return parseInt(lm[1]);
+        }
+      }
+
+      // Source 5: description field — same safe pattern as Source 1
+      m=(item.description||'').match(/(?<![0-9])x\s*(\d+)(?:\s*(?:pack|pcs|units?))?/i);
+      if(m && parseInt(m[1])>=6) return parseInt(m[1]);
+
+      return null;
+    }
+
+    // ── RENDER SERVICE PATH (spreadsheets) ─────────────────────────────────
+    // One HTTP request per workbook. The service samples the layout, asks Gemini
+    // for a JSON extraction plan, then executes that plan in Python across every
+    // sheet and row — so a 4000-row workbook costs one model call, not forty.
+    function normaliseRenderRow(p){
+      const price=parseFloat(p.calculated_price!=null?p.calculated_price:(p.selling_price||0))||0;
+      return {
+        _uid:Math.random().toString(36).slice(2),
+        product_id:p.product_id||slugify(p.product_name),
+        product_name:p.product_name||'',
+        description:p.description||'',
+        category:p.category||'Uncategorised',
+        brand:p.brand||'',
+        barcode:p.barcode||p.sku||'',
+        sku:p.sku||'',
+        image_url:p.image_url||'',
+        selling_price:parseFloat(p.selling_price!=null?p.selling_price:price)||0,
+        calculated_price:price,
+        cost_price:parseFloat(p.cost_price||0)||0,
+        variant_enabled:String(p.variant_enabled||'No').toLowerCase()==='yes'?'Yes':'No',
+        attr1_name:p.attr1_name||'', attr1_val:p.attr1_val||'',
+        attr2_name:p.attr2_name||'', attr2_val:p.attr2_val||'',
+        attr3_name:p.attr3_name||'', attr3_val:p.attr3_val||'',
+        source_sheet:p.source_sheet||'', source_row:p.source_row||'',
+        _casePrice:p._casePrice||false,
+        _packQty:p._packQty||null,
+        _originalCasePrice:p._originalCasePrice||null,
+        _basePrice:p._basePrice||null,
+        _correctedPrice:p._correctedPrice||null,
+        _caseApproved:p._caseApproved||false,
+        _fromRender:true
+      };
+    }
+
+    async function processViaRender(f, idx, total){
+      try{
+        const fd=new FormData();
+        fd.append('file', f.file, f.name);
+        fd.append('parse_mode', parseMode);
+        fd.append('ai_instructions', document.getElementById('aiNotesInput').value.trim());
+        fd.append('vat_enabled', document.querySelector('.chip[data-instruction="vat"]')?.classList.contains('active')?'true':'false');
+        fd.append('track_stock', trackStockEnabled?'true':'false');
+        if(apiKey) fd.append('gemini_api_key', apiKey);
+
+        const res=await fetch(RENDER_API_URL.replace(/\/$/,'')+'/process-retail-file-json',{method:'POST',body:fd});
+        if(!res.ok){
+          console.warn('Render HTTP '+res.status, await res.text().catch(()=>''));
+          return false;
+        }
+        const data=await res.json();
+        if(!data || !Array.isArray(data.products)) return false;
+
+        const rows=data.products.map(normaliseRenderRow).filter(r=>r.product_name);
+        _renderMeta[f.name]={
+          summary:data.summary||{},
+          issues:data.issues||[],
+          conflicts:data.price_conflicts||[]
+        };
+
+        if(!rows.length){ updateProgressRow(idx,'done','No products found',total); return true; }
+
+        // Render rows are already exploded (one row per variant) — push straight
+        // into masterData. expandItem() skips them via the _fromRender flag.
+        rows.forEach(r=>{ rawItems.push(r); masterData.push(r); });
+
+        const strat=String((data.summary||{}).layout_strategy||'').replace(/_/g,' ');
+        updateProgressRow(idx,'done',rows.length+' item'+(rows.length!==1?'s':'')+(strat?' · '+strat:''),total);
+        return true;
+      }catch(err){
+        console.error('Render call failed:',err);
+        return false;
+      }
+    }
+
+    // Fallback only: rebuild the old client-side sheet text so an unreachable
+    // Render service degrades to in-browser Gemini extraction instead of failing.
+    async function buildStructuredText(file, ext){
+      const wb=XLSX.read(await file.arrayBuffer(),{type:'array'});
+      const out=[];
+      wb.SheetNames.forEach(sn=>{
+        const csv=XLSX.utils.sheet_to_csv(wb.Sheets[sn]);
+        const nonEmpty=csv.split('\n').filter(l=>l.replace(/,/g,'').trim());
+        if(nonEmpty.length<2) return;
+        const cleaned=csv.replace(/(\d+\.\d{4,})/g,m=>parseFloat(m).toFixed(2));
+        const filtered=cleaned.split('\n').filter(l=>{
+          const parts=l.split(',').map(p=>p.replace(/"/g,'').trim()).filter(Boolean);
+          if(!parts.length) return false;
+          return parts.some(p=>!/^-?[\d.]+$/.test(p));
+        }).join('\n');
+        if(filtered.trim()) out.push('## Sheet: '+sn+'\n'+filtered);
+      });
+      if(!out.length) throw new Error('No data found in '+file.name);
+      return out.join('\n\n');
+    }
+
+    function buildPrompt(mode,notes){
+      const mb=mode==='single'?'=== PARSE MODE: SINGLE ===\nEach product line becomes ONE row. Do NOT group variants. Return attributes as [] for every item. Keep size/option in the product name exactly as written.':'=== PARSE MODE: VARIANT ===\nGroup products into ONE entry with variants ONLY when they share an identical base name AND differ ONLY by an explicit size/volume/weight/count suffix.\n\n=== STRICT VARIANT RULES ===\nRULE 1 — These differences qualify as variants:\n  • Volume/weight suffixes: 500ml, 1L, 2L, 250g, 1kg, 2kg, 375ml, 750ml, etc.\n  • Size labels: S, M, L, XL, Small, Medium, Large, Extra Large\n  • Pack counts: x6, x12, x24 (see Rule 9)\n  • Explicit portion labels: 6-piece, 12-piece\n  • DASH-SEPARATED flavours: "Product Name - Flavour" pattern → use attribute name "Flavour"\n\nRULE 2 — DASH SEPARATOR IS A VARIANT SIGNAL:\n  When products share identical text BEFORE a dash " - " and differ only AFTER the dash, they are Flavour variants.\n  • "Brutal Fruit 620ml - apple", "Brutal Fruit 620ml - manic mango", "Brutal Fruit 620ml - Ruby"\n    → before dash = "Brutal Fruit 620ml" (identical) → group as Flavour variants ✓\n  • "Bernini - classic 275ml", "Bernini - blush 275ml"\n    → before dash = "Bernini" (identical) → group as Flavour variants ✓\n\nRULE 3 — NO DASH = DO NOT group on flavour/type words embedded in the name:\n  • "Sunbake brown bread" vs "Sunbake white bread" → no dash, "brown"/"white" embedded → SEPARATE ✓\n  • "Rajah hot" vs "Rajah mild" → no dash → SEPARATE ✓\n\nRULE 4 — THE TWO TESTS (apply independently, never combine into a matrix):\n  TEST A — SIZE TEST: Strip size/volume suffix. Are the remaining base names CHARACTER-FOR-CHARACTER identical? If yes → Size variants.\n  TEST B — DASH TEST: Does the name contain " - "? Is the text BEFORE the dash identical across multiple products? If yes → Flavour variants.\n  If NEITHER test passes → Separate products. DO NOT combine Size and Flavour into a matrix.\n  Examples:\n  • "Brutal Fruit 500ml - Apple" + "Brutal Fruit 500ml - Strawberry" → TEST B: "Brutal Fruit 500ml" identical before dash → Flavour variants ✓\n  • "Brutal Fruit 620ml - apple" + "Brutal Fruit 500ml - apple" → TEST B: "620ml" ≠ "500ml" before dash → SEPARATE ✓\n  • "Ultra Mel Milk 1L" + "Ultra Mel Milk 500ml" → TEST A: "Ultra Mel Milk" identical → Size variants ✓\n  • "Castle 330ml" + "Castle Lite 330ml" + "Castle Double Malt 660ml" → TEST A: bases differ ("Castle" ≠ "Castle Lite" ≠ "Castle Double Malt") → SEPARATE ✓\n  • "Sunbake brown bread" + "Sunbake white bread" → TEST A fails, TEST B no dash → SEPARATE ✓\n\nRULE 4 — CASE PACKS ARE NOT SIZE VARIANTS: "Gordons 200ml x 12" and "Gordons 750ml" are NOT variants of each other. A case pack (x N) is always a separate product entry — never group it as a size variant of a single-unit product.\nRULE 5 — WHEN IN DOUBT, keep as separate products. Over-grouping causes incorrect Yoco imports. Under-grouping is always safer.\n\nRULE 6 — Output format for variants:\n  • product_name: base name WITHOUT the size/flavour suffix\n    - Size variants: strip size suffix → "Ultra Mel Milk" (not "Ultra Mel Milk 1L")\n    - Flavour variants: strip " - flavour" → "Brutal Fruit 620ml" (not "Brutal Fruit 620ml - apple")\n  • For Size variants: attribute name = "Size"\n  • For Flavour variants: attribute name = "Flavour"\n  • product_name: base name WITHOUT the size (e.g. "Ultra Mel Milk" not "Ultra Mel Milk 1L")\n  • selling_price: the lowest price in the group\n  • attributes: [{ "name": "Size", "values": [{ "label": "500ml", "price_adjustment": 0 }, { "label": "1L", "price_adjustment": 10 }] }]\n  • price_adjustment = that variant\'s price MINUS the base (lowest) price\n\nRULE 7 — Single products (no qualifying variants) get empty attributes: []';
+      return 'You are a Retail POS Data Architect specialising in Yoco POS imports.\nExtract a retail price list into structured JSON.\n\n'+mb+'\n\n=== PAGE VALIDITY CHECK (run this FIRST) ===\nBefore extracting, assess whether this page is a real product or price page.\nA real product page has close to a 1:1 ratio of product names to prices.\nIf fewer than 40% of identifiable items have a visible price, the page is likely\na cover page, intro, table of contents, terms & conditions, or decorative content.\nIn that case return {"items":[]} immediately. Do NOT extract headings or sentences as product names.\nEXCEPTION: Pre-exploded variant files (where rows have blank product names but share a handle/slug and have option values) are always valid product pages regardless of the price ratio — do not skip them.\nSigns of a non-product page: no prices visible, mostly paragraph text, company bios, contact info.\n\n=== RULES ===\n1. Category is MANDATORY. Infer from product type, brand, or context. Examples: Dairy, Bakery, Cleaning, Beverages, Spices, Personal Care, Snacks, Canned Goods, Household, Hardware, Garden & Tools, Clothing & Apparel, Spirits, Wine, Beer, Soft Drinks, Stationery, Electrical. This list is not exhaustive — use any meaningful retail category. NEVER output Uncategorised — always make your best inference.\n2. Barcodes/SKU/PLU/UPC/EAN/Product Code → barcode field. If multiple code columns exist pick the one most likely to be a scannable barcode (longest numeric string, or prefixed with *). If a dedicated Barcode column is empty but a SKU/Variant SKU column has a value, use the SKU as the barcode.\n3. PRICE COLUMN SELECTION: When multiple price columns exist, use this priority: (1) column labelled Selling/Sell/Sale/Retail, (2) Inc VAT/Incl VAT/Price incl, (3) the highest numeric price column. NEVER use Ex VAT/Excl VAT/Cost/Nett/Wholesale as the selling price — those are cost prices, not retail prices. Always strip currency symbols and spaces from prices before using them (e.g. "R 15.00" → 15.00, "R140,00" → 140.00). Treat commas as decimal separators when no period is present.\n4. MULTI-COLUMN LAYOUTS: Spreadsheets often place two or more independent product lists side by side on the same sheet, separated by blank columns. This is VERY common in SA retail and wholesale price lists.\nHOW TO DETECT: A row contains TWO products when you see a pattern like: [No] [Name] [Price] [blank] [No] [Name] [Price] — i.e. the row has two sets of number/name/price separated by a blank tab column.\nHOW TO PARSE: Split each such row into LEFT and RIGHT sections at the blank column separator. Extract EACH section as a separate product. The left product gets the left name and left price. The right product gets the right name and right price.\nEXTRA PRICE COLUMNS: Some rows have additional price columns after the right product (e.g. "200ml" and "300ml" headers with prices beneath). These represent size variants of the right-side product — create variant entries for each size with its corresponding price.\nSECTION HEADERS: When a row contains only category labels (e.g. "WINE", "SPIRIT", "QUARTS", "CANS") in the name positions with no prices, use those as the category for all products below until the next header row.\nCRITICAL: You MUST extract products from BOTH the left AND right columns of every row. Never read only the left column. Count both sides — a sheet with 30 left-column rows and 30 right-column rows has 60 products, not 30.\nTHREE-PRICE ROWS: When a right-side product has additional numeric columns after its price (e.g. headers like "200ml", "300ml" with prices beneath), treat these as size variants of that product. The base product uses the first price; each extra column becomes a variant with that size label and price.\nUNEQUAL LENGTH COLUMNS: The right column may contain MORE rows than the left column. When the left side runs out of data, continue extracting right-column products until both columns are exhausted.\n5. PRE-EXPLODED VARIANT ROWS: Some files (e.g. exports from e-commerce platforms) already have one row per variant — the product name/title only appears on the first row, and subsequent rows for the same product are blank in the name column but have different sizes, colours, or option values. Detect this pattern (repeated blank names with a shared identifier/handle/slug in another column, or sequential rows with the same name and different option values). Collapse these into ONE product entry with the correct attributes array — do NOT create separate products for each variant row.\nTWO ATTRIBUTE AXES: When two independent option columns exist (e.g. Colour and Size), produce a full two-attribute entry using both. Set Attribute 1 = first option (e.g. Colour), Attribute 2 = second option (e.g. Size).\nVARIANT PRICE DIFFERENCES: When variant rows have different prices (e.g. XL costs more than S), set selling_price to the lowest price in the group and calculate price_adjustment as the difference for each variant (e.g. if base is R500 and XL is R550, price_adjustment for XL = 50).\n6. MISSING PRICES: If a product row has no detectable price, set selling_price to 0. Do NOT skip the row — include it with selling_price: 0 so the user can review and fix it.\n7. IMAGE URLS: If the source data contains image URL columns (Image Src, Image URL, Photo, Picture, img_url or similar), extract the first/primary image URL for each product and include it as image_url in the output. When multiple image rows exist for the same product (e.g. Image Position 1, 2, 3), use only the one with the lowest position number (the hero/main image). Do not use variant-specific swatch images.\n9. CASE/PACK PRICING: Product names sometimes include a quantity multiplier like "x 12", "x 24", "x 6 pack".\nRULE: When a product name contains "x N" (N ≥ 6), treat the x N as a SIZE VARIANT — do NOT rename the product or remove the x N from the name. Keep the full name as-is (e.g. "Gordons 200ml x 12") and add an attribute: name="Pack Size", values=[{label:"x 12", price_adjustment:0}].\nPRICE LOGIC — TWO CASES:\nCASE A — A single-unit version of the same product EXISTS in the data (e.g. "Coke 440ml = R15" AND "Coke 440ml x 24 = R15"): The x-qty price is clearly wrong (same as the single price). Correct it: selling_price = single_unit_price × N. So Coke x24 selling_price = 15 × 24 = 360.\nCASE B — No single-unit version exists: Preserve the listed price as-is and flag it in the description: "[CASE PRICE — verify: R{listed} listed for x{N} units. Correct if this is the case price not unit price.]". Set selling_price to the listed value.\nFor x 2 or x 3, use judgement — small multipacks may already be priced per pack correctly.\n8. Extract EVERY SINGLE product — never skip, truncate, or summarise rows. Process ALL sheets in a workbook.\n\n=== OUTPUT: valid JSON only, no markdown ===\n{"items":[{"category":"string","product_name":"string","description":"string","selling_price":0,"barcode":"string","image_url":"string or empty","attributes":[]}]}\n\nUSER INSTRUCTIONS: '+(notes||'None');
+    }
+
+    async function fetchWithRetry(url, options, retries=8){
+      // Bulletproof retry strategy:
+      // - 429: read Retry-After header, wait exactly what Google says + 2s buffer
+      // - 500/503: transient server error, exponential backoff with jitter
+      // - 400/403: permanent error, fail immediately (no point retrying)
+      // - Never counts 429s against the retry limit — they WILL succeed eventually
+      const BASE_DELAY=2000;
+      let attempt=0;
+      while(attempt<retries){
+        try{
+          const res=await fetch(url,options);
+          if(res.ok) return await res.json();
+
+          // Permanent errors — fail immediately
+          if(res.status===400||res.status===403||res.status===404){ // 401 is NOT here — handled as rate limit above
+            throw new Error('API '+res.status+' (permanent)');
+          }
+
+          // Rate limit — read Retry-After header, don't count against retries
+          // NOTE: In Gemini Canvas (blob URL), rate limiting returns 401 not 429.
+          // Both are treated identically — wait and retry without burning a retry slot.
+          if(res.status===429||res.status===401){
+            let waitMs=30000; // default 30s
+            if(res.status===429){
+              try{
+                const retryAfter=res.headers.get('Retry-After')||res.headers.get('retry-after');
+                const body=await res.json().catch(()=>({}));
+                const bodyDelay=body?.error?.details?.find(d=>d['@type']?.includes('RetryInfo'))?.retryDelay;
+                if(bodyDelay) waitMs=parseInt(bodyDelay)*1000;
+                else if(retryAfter) waitMs=parseInt(retryAfter)*1000;
+                waitMs=Math.max(waitMs, 30000)+2000;
+              } catch(e){}
+            }
+            console.warn('Rate limited ('+res.status+') — waiting '+Math.round(waitMs/1000)+'s then retrying');
+            await new Promise(r=>setTimeout(r,waitMs));
+            continue; // don't increment attempt
+          }
+
+          // Transient server error — exponential backoff with jitter
+          if(res.status>=500){
+            if(attempt>=retries-1) throw new Error('API '+res.status+' after '+retries+' attempts');
+            const jitter=Math.random()*1000;
+            const wait=Math.min(BASE_DELAY*Math.pow(2,attempt)+jitter, 60000);
+            console.warn('Server error '+res.status+', retrying in '+Math.round(wait/1000)+'s');
+            await new Promise(r=>setTimeout(r,wait));
+            attempt++;
+            continue;
+          }
+
+          throw new Error('API '+res.status);
+        } catch(err){
+          if(err.message.includes('permanent')) throw err;
+          if(attempt>=retries-1) throw err;
+          const jitter=Math.random()*500;
+          await new Promise(r=>setTimeout(r,BASE_DELAY*Math.pow(2,attempt)+jitter));
+          attempt++;
+        }
+      }
+      throw new Error('Max retries exceeded');
+    }
+
+    // ── FILE PROGRESS helpers ──────────────────────────────
+    function _shortName(n){ return n.length>36?n.slice(0,33)+'…':n; }
+
+    // Group flat uploadedFiles array into logical file groups (PDF pages collapse under parent)
+    function _buildFileGroups(files){
+      const groups=[], seen={};
+      files.forEach((f,i)=>{
+        // PDF pages: "filename.pdf (p3)"
+        const pageMatch=f.name.match(/^(.+) \(p(\d+)\)$/);
+        // Excel sheets: parentFile property set at upload
+        const sheetParent=f.parentFile;
+
+        if(pageMatch){
+          const base=pageMatch[1];
+          if(!seen[base]){
+            seen[base]={ type:'pdf', base, indices:[], groupId:'sg-'+Object.keys(seen).length };
+            groups.push(seen[base]);
+          }
+          seen[base].indices.push(i);
+        } else if(sheetParent){
+          // Excel sheet — group under parent filename
+          const key='xlsx:'+sheetParent;
+          if(!seen[key]){
+            seen[key]={ type:'xlsx', base:sheetParent, indices:[], groupId:'sg-'+Object.keys(seen).length };
+            groups.push(seen[key]);
+          }
+          seen[key].indices.push(i);
+        } else {
+          groups.push({ type:'single', base:f.name, indices:[i], groupId:'sg-'+groups.length });
+        }
+      });
+      return groups;
+    }
+
+    let _fileGroups=[];
+
+    function buildProgressUI(files){
+      _fileGroups=_buildFileGroups(files);
+      const container=document.getElementById('scanPills'); container.innerHTML='';
+
+      _fileGroups.forEach(g=>{
+        const row=document.createElement('div');
+        row.className='scan-file-row'; row.id=g.groupId;
+
+        const isMultiPage=g.type==='pdf'&&g.indices.length>1;
+        const chevronSvg=isMultiPage
+          ? '<svg class="scan-file-chevron" id="chev-'+g.groupId+'" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4,6 8,10 12,6"/></svg>'
+          : '<span style="width:14px"></span>';
+        const pageMeta=isMultiPage?(g.type==='xlsx'?g.indices.length+' sheets':g.indices.length+' pages'):'';
+
+        row.innerHTML=
+          '<div class="scan-file-header'+(isMultiPage?'':' no-toggle')+'" id="hdr-'+g.groupId+'">'+
+            '<span class="scan-file-dot" id="dot-'+g.groupId+'"></span>'+
+            '<span class="scan-file-name">'+_shortName(g.base)+'</span>'+
+            '<span class="scan-file-meta" id="meta-'+g.groupId+'">'+pageMeta+'</span>'+
+            chevronSvg+
+          '</div>'+
+          (isMultiPage
+            ? '<div class="scan-file-pages collapsed" id="pages-'+g.groupId+'">'+
+                g.indices.map((fileIdx,pi)=>{
+                    const sheetLabel=uploadedFiles[fileIdx]?.sheetName||('p'+(pi+1));
+                    return '<span class="scan-page-chip" id="chip-'+g.groupId+'-'+pi+'">'+sheetLabel+'</span>';
+                  }).join('')+
+              '</div>'
+            : '');
+
+        if(isMultiPage){
+          row.querySelector('#hdr-'+g.groupId).onclick=()=>{
+            const pagesEl=document.getElementById('pages-'+g.groupId);
+            const chev=document.getElementById('chev-'+g.groupId);
+            const collapsed=pagesEl.classList.toggle('collapsed');
+            if(chev) chev.classList.toggle('open',!collapsed);
+          };
+        }
+        container.appendChild(row);
+      });
+
+      document.getElementById('scanNum').textContent='0';
+      document.getElementById('scanTotal').textContent='of '+files.length;
+      document.getElementById('scanLabel').textContent='Scanning…';
+      document.getElementById('scanFilename').textContent='';
+      document.getElementById('scanRingFill').style.strokeDashoffset='251';
+      document.getElementById('emptyState').classList.add('hidden');
+      document.getElementById('scanState').classList.remove('hidden');
+      document.getElementById('processBtn').classList.add('hidden');
+    }
+
+    function updateProgressRow(idx, state, msg, total){
+      // Find which group this file index belongs to
+      const group=_fileGroups.find(g=>g.indices.includes(idx));
+      if(group){
+        const pageIdx=group.indices.indexOf(idx);
+        // Update individual page chip if multi-page PDF
+        if(group.indices.length>1){
+          const chip=document.getElementById('chip-'+group.groupId+'-'+pageIdx);
+          if(chip) chip.className='scan-page-chip '+(state==='active'?'active':state==='done'?'done':state==='error'?'error':'');
+        }
+        // Update group row state: active if any page active, done only when ALL pages done, error if any error
+        const row=document.getElementById(group.groupId);
+        const dot=document.getElementById('dot-'+group.groupId);
+        const meta=document.getElementById('meta-'+group.groupId);
+        if(row&&dot){
+          if(state==='error'){
+            row.className='scan-file-row error'; dot.className='scan-file-dot';
+          } else if(state==='active'){
+            row.className='scan-file-row active'; dot.className='scan-file-dot';
+          } else if(state==='done'){
+            // Only mark group done when last page of that group is done
+            const lastIdx=group.indices[group.indices.length-1];
+            if(idx===lastIdx){ row.className='scan-file-row done'; dot.className='scan-file-dot'; }
+          }
+        }
+        if(meta&&state==='done'){
+          const doneCount=group.indices.filter((_,pi)=>{
+            const c=document.getElementById('chip-'+group.groupId+'-'+pi);
+            return c&&c.classList.contains('done');
+          }).length+1;
+          if(group.indices.length>1) meta.textContent=doneCount+' / '+group.indices.length+' pages';
+          else meta.textContent=msg;
+        }
+        if(meta&&state==='active'&&group.indices.length===1) meta.textContent='Scanning…';
+      }
+
+      const done=state==='done'?idx+1:idx;
+      document.getElementById('scanNum').textContent=done;
+      document.getElementById('scanTotal').textContent='of '+total;
+      document.getElementById('scanRingFill').style.strokeDashoffset=(251*(1-done/total)).toFixed(1);
+      if(state==='active'){
+        document.getElementById('scanLabel').textContent='Scanning…';
+        document.getElementById('scanFilename').textContent=uploadedFiles[idx]?_shortName(uploadedFiles[idx].name):'';
+      } else if(state==='done'){
+        document.getElementById('scanLabel').textContent=done===total?'Finishing up…':'Scanning…';
+      } else if(state==='error'){
+        document.getElementById('scanFilename').textContent='Error on file '+(idx+1);
+      }
+    }
+
+    // ── DUPLICATE CHECK ────────────────────────────────────
+    function runDuplicateCheck(){
+      // True duplicate = same product_name AND same variant combo.
+      // Variant rows that share a product_name but have DIFFERENT variant values
+      // are intentional (e.g. Coke · Regular, Coke · Sugar Free) — NOT duplicates.
+      const comboMap={};
+      masterData.forEach(row=>{
+        const n=(row.product_name||'').toLowerCase().trim();
+        const vk=[row.attr1_val||'',row.attr2_val||'',row.attr3_val||''].join('|');
+        const key=n+'::'+vk;
+        comboMap[key]=(comboMap[key]||0)+1;
+      });
+      const dupKeys=new Set(Object.entries(comboMap).filter(([,c])=>c>1).map(([k])=>k));
+      masterData.forEach(row=>{
+        const n=(row.product_name||'').toLowerCase().trim();
+        const vk=[row.attr1_val||'',row.attr2_val||'',row.attr3_val||''].join('|');
+        row._isDup=dupKeys.has(n+'::'+vk);
+      });
+      const dupNames=[...new Set(masterData.filter(r=>r._isDup).map(r=>(r.product_name||'').toLowerCase().trim()))];
+      const banner=document.getElementById('dupBanner');
+      if(!dupNames.length){ banner.classList.add('hidden'); return; }
+      banner.classList.remove('hidden');
+      document.getElementById('dupCount').textContent=dupNames.length+' duplicate product'+(dupNames.length>1?'s':'');
+      const list=document.getElementById('dupList'); list.innerHTML='';
+      dupNames.slice(0,10).forEach(name=>{ const tag=document.createElement('span'); tag.className='dup-tag'; tag.textContent=name; tag.onclick=()=>{ document.getElementById('masterFilter').value=name; currentPage=1; renderTable(); }; list.appendChild(tag); });
+      if(dupNames.length>10){ const more=document.createElement('span'); more.className='dup-tag'; more.style.background='transparent'; more.textContent='+'+(dupNames.length-10)+' more'; list.appendChild(more); }
+    }
+    document.getElementById('dupDismiss').onclick=()=>document.getElementById('dupBanner').classList.add('hidden');
+
+    // ── VERIFICATION PASS ──────────────────────────────────
+    function runVerification(){
+      if(!masterData.length){ document.getElementById('verifyPanel').classList.add('hidden'); return; }
+
+      const rules=[
+        {
+          id:'no-empty-name',
+          name:'Product name not empty',
+          field:'product_name', fieldLabel:'Product name', fieldType:'text',
+          getRows: rows=>rows.filter(r=>!r.product_name?.trim()),
+          check: rows=>{ const bad=rows.filter(r=>!r.product_name?.trim()); return{pass:bad.length===0,count:bad.length,total:rows.length,level:bad.length?'err':'ok',filter:''}; }
+        },
+        {
+          id:'no-zero-price',
+          name:'Price greater than R0.00',
+          field:'selling_price', fieldLabel:'Price (R)', fieldType:'number',
+          getRows: rows=>rows.filter(r=>parseFloat(r.calculated_price||0)===0),
+          check: rows=>{ const bad=rows.filter(r=>parseFloat(r.calculated_price||0)===0); return{pass:bad.length===0,count:bad.length,total:rows.length,level:bad.length?'warn':'ok',filter:''}; }
+        },
+        {
+          id:'no-negative-price',
+          name:'No negative prices',
+          field:'selling_price', fieldLabel:'Price (R)', fieldType:'number',
+          getRows: rows=>rows.filter(r=>parseFloat(r.calculated_price||0)<0),
+          check: rows=>{ const bad=rows.filter(r=>parseFloat(r.calculated_price||0)<0); return{pass:bad.length===0,count:bad.length,total:rows.length,level:bad.length?'err':'ok',filter:''}; }
+        },
+        {
+          id:'variant-price-ok',
+          name:'Variant price ≥ base price',
+          field:'calculated_price', fieldLabel:'Variant price (R)', fieldType:'number',
+          getRows: rows=>rows.filter(r=>r.variant_enabled==='Yes'&&parseFloat(r.calculated_price||0)<parseFloat(r.selling_price||0)),
+          check: rows=>{ const bad=rows.filter(r=>r.variant_enabled==='Yes'&&parseFloat(r.calculated_price||0)<parseFloat(r.selling_price||0)); return{pass:bad.length===0,count:bad.length,total:rows.length,level:bad.length?'err':'ok',filter:''}; }
+        },
+        {
+          id:'default-price-consistent',
+          name:'Default price consistent across variants',
+          getRows: rows=>{
+            // Group variant rows by product_id, find groups where selling_price differs
+            const groups={};
+            rows.filter(r=>r.variant_enabled==='Yes').forEach(r=>{
+              if(!groups[r.product_id]) groups[r.product_id]=[];
+              groups[r.product_id].push(r);
+            });
+            const bad=[];
+            Object.values(groups).forEach(grp=>{
+              const prices=[...new Set(grp.map(r=>parseFloat(r.selling_price||0).toFixed(2)))];
+              if(prices.length>1) bad.push(...grp); // more than one unique selling_price in group
+            });
+            return bad;
+          },
+          check: rows=>{
+            const groups={};
+            rows.filter(r=>r.variant_enabled==='Yes').forEach(r=>{
+              if(!groups[r.product_id]) groups[r.product_id]=[];
+              groups[r.product_id].push(r);
+            });
+            let badCount=0;
+            Object.values(groups).forEach(grp=>{
+              const prices=[...new Set(grp.map(r=>parseFloat(r.selling_price||0).toFixed(2)))];
+              if(prices.length>1) badCount+=grp.length;
+            });
+            return{pass:badCount===0,count:badCount,total:rows.length,level:badCount?'err':'ok',filter:''};
+          }
+        },
+        {
+          id:'no-uncategorised',
+          name:'All products categorised',
+          field:'category', fieldLabel:'Category', fieldType:'text',
+          getRows: rows=>rows.filter(r=>!r.category||r.category.trim().toLowerCase()==='uncategorised'),
+          check: rows=>{ const bad=rows.filter(r=>!r.category||r.category.trim().toLowerCase()==='uncategorised'); return{pass:bad.length===0,count:bad.length,total:rows.length,level:bad.length?'warn':'ok',filter:'Uncategorised'}; }
+        },
+        {
+          id:'unique-ids',
+          name:'No duplicate product IDs (singles only)',
+          check: rows=>{
+            // A product ID shared across variant rows is CORRECT — Yoco expects it.
+            // Only flag a product ID as duplicate if the same ID appears on two rows
+            // that are BOTH single items (variant_enabled !== 'Yes').
+            const singleIds=rows.filter(r=>r.variant_enabled!=='Yes').map(r=>r.product_id);
+            const badIds=singleIds.filter((id,i)=>id&&singleIds.indexOf(id)!==i);
+            const badCount=new Set(badIds).size;
+            return{pass:badCount===0,count:badCount,total:rows.length,level:badCount?'err':'ok',filter:''};
+          }
+        },
+        {
+          id:'no-dup-names',
+          name:'No duplicate product name + variant combos',
+          check: rows=>{
+            // Same check as the duplicate banner — name+variant key must be unique
+            const seen={};
+            rows.forEach(r=>{
+              const n=(r.product_name||'').toLowerCase().trim();
+              const vk=[r.attr1_val||'',r.attr2_val||'',r.attr3_val||''].join('|');
+              const key=n+'::'+vk;
+              seen[key]=(seen[key]||0)+1;
+            });
+            const dupCount=Object.values(seen).filter(c=>c>1).length;
+            return{pass:dupCount===0,count:dupCount,total:rows.length,level:dupCount?'warn':'ok',filter:''};
+          }
+        },
+        {
+          id:'variant-attrs-match',
+          name:'Variant rows have attribute values',
+          check: rows=>{
+            // Variant Enabled=yes but no attribute value = Yoco will reject on import
+            const bad=rows.filter(r=>r.variant_enabled==='Yes'&&(!r.attr1_val||!r.attr1_val.trim()));
+            return{pass:bad.length===0,count:bad.length,total:rows.length,level:bad.length?'err':'ok',filter:''};
+          }
+        },
+        {
+          id:'name-length',
+          name:'Product name ≤ 100 characters',
+          check: rows=>{ const bad=rows.filter(r=>(r.product_name||'').length>100); return{pass:bad.length===0,count:bad.length,total:rows.length,level:bad.length?'warn':'ok',filter:''}; }
+        },
+        {
+          id:'case-price',
+          name:'Case/pack prices auto-corrected',
+          check: rows=>{
+            // Rows with x N qty in name — either corrected or needing manual review
+            const bad=rows.filter(r=>(r.description||'').includes('[CASE PRICE'));
+            const unresolved=rows.filter(r=>(r.description||'').includes('verify:'));
+            return{pass:bad.length===0,count:unresolved.length||bad.length,total:rows.length,level:unresolved.length?'warn':bad.length?'warn':'ok',filter:''};
+          }
+        }
+      ];
+
+      let errCount=0, warnCount=0;
+      const rulesContainer=document.getElementById('verifyRules'); rulesContainer.innerHTML='';
+
+      rules.forEach(rule=>{
+        const result=rule.check(masterData);
+        if(result.level==='err') errCount++;
+        else if(result.level==='warn') warnCount++;
+
+        const row=document.createElement('div'); row.className='verify-rule';
+        const detail=result.pass
+          ? (result.total+' / '+result.total+' passed')
+          : (result.count+' issue'+(result.count>1?'s':'')+' found');
+
+        const hasFixable=!result.pass && rule.getRows;
+        row.innerHTML=
+          '<div class="verify-rule-left">'+
+            '<span class="vr-dot '+result.level+'"></span>'+
+            '<span class="vr-name">'+rule.name+'</span>'+
+          '</div>'+
+          '<span class="vr-detail">'+detail+'</span>'+
+          (hasFixable
+            ? '<button class="vr-filter" style="'+(result.level==='err'?'background:var(--yds-red-40);color:var(--yds-red-690);border-color:var(--yds-red-540)':'')+'">Fix</button>'
+            : result.filter
+              ? '<button class="vr-filter" data-filter="'+result.filter+'">Show</button>'
+              : '<span></span>');
+
+        if(hasFixable){
+          row.querySelector('.vr-filter').onclick=()=>{ openFixModal(rule, result); };
+        } else if(result.filter){
+          row.querySelector('.vr-filter').onclick=()=>{ document.getElementById('masterFilter').value=result.filter; currentPage=1; renderTable(); };
+        }
+        rulesContainer.appendChild(row);
+      });
+
+      // Score badge
+      const score=document.getElementById('verifyScore');
+      const footerMsg=document.getElementById('verifyFooterMsg');
+      const exportBtn=document.getElementById('verifyExportBtn');
+
+      if(errCount>0){
+        score.className='verify-score fail'; score.textContent='✕';
+        footerMsg.className='verify-msg has-errors'; footerMsg.textContent=errCount+' error'+(errCount>1?'s':'')+' must be fixed before export.';
+        exportBtn.disabled=true; exportBtn.classList.add('btn-ghost'); exportBtn.classList.remove('btn-brand');
+      } else if(warnCount>0){
+        score.className='verify-score warn'; score.textContent='!';
+        footerMsg.className='verify-msg'; footerMsg.textContent=warnCount+' warning'+(warnCount>1?'s':'')+' — review before exporting.';
+        exportBtn.disabled=false; exportBtn.classList.remove('btn-ghost'); exportBtn.classList.add('btn-brand');
+      } else {
+        score.className='verify-score pass'; score.textContent='✓';
+        footerMsg.className='verify-msg'; footerMsg.textContent='All checks passed — ready to export.';
+        exportBtn.disabled=false; exportBtn.classList.remove('btn-ghost'); exportBtn.classList.add('btn-brand');
+      }
+
+      document.getElementById('verifySubtitle').textContent=masterData.length+' rows checked against Yoco upload standards';
+      document.getElementById('verifyPanel').classList.remove('hidden');
+      // Set summary badge — body stays collapsed, user opens it
+      const badge=document.getElementById('verifyBadge');
+      badge.classList.remove('hidden','vsb-ok','vsb-warn','vsb-err');
+      if(errCount>0){ badge.className='verify-status-badge vsb-err'; badge.textContent=errCount+' error'+(errCount>1?'s':''); }
+      else if(warnCount>0){ badge.className='verify-status-badge vsb-warn'; badge.textContent=warnCount+' warning'+(warnCount>1?'s':''); }
+      else { badge.className='verify-status-badge vsb-ok'; badge.textContent='All checks passed'; }
+
+      // Also annotate masterData rows for table highlighting
+      masterData.forEach(row=>{ row._issues=[]; });
+      masterData.filter(r=>!r.product_name?.trim()).forEach(r=>r._issues.push('err'));
+      masterData.filter(r=>parseFloat(r.calculated_price||0)<0).forEach(r=>r._issues.push('err'));
+      masterData.filter(r=>r.variant_enabled==='Yes'&&parseFloat(r.calculated_price||0)<parseFloat(r.selling_price||0)).forEach(r=>r._issues.push('err'));
+      masterData.filter(r=>parseFloat(r.calculated_price||0)===0).forEach(r=>r._issues.push('warn'));
+      masterData.filter(r=>!r.category||r.category.toLowerCase()==='uncategorised').forEach(r=>r._issues.push('warn'));
+
+      renderTable();
+    }
+
+    document.getElementById('rerunVerify').onclick=()=>{ runVerification(); runDuplicateCheck(); };
+    document.getElementById('verifyToggle').onclick=()=>{
+      const body=document.getElementById('verifyBody');
+      const chev=document.getElementById('verifyChevron');
+      const open=body.classList.toggle('open');
+      chev.classList.toggle('open',open);
+    };
+    // ── Export onboarding queue ─────────────────────────────────────────────
+    // All error/warning/case steps are queued and shown one by one before export
+    let _exportSteps=[];
+    let _exportStepIdx=0;
+
+    function triggerExport(){
+      _exportSteps=[];
+      _exportStepIdx=0;
+
+      // Collect all error rules that have issues
+      const errorRules=[
+        { id:'no-empty-name',    getRows:rows=>rows.filter(r=>!r.product_name?.trim()),                                                                              field:'product_name',    fieldLabel:'Product name',    fieldType:'text',   name:'Product name not empty',        level:'err' },
+        { id:'no-negative-price',getRows:rows=>rows.filter(r=>parseFloat(r.calculated_price||0)<0),                                                                  field:'selling_price',   fieldLabel:'Price (R)',        fieldType:'number', name:'No negative prices',            level:'err' },
+        { id:'variant-price-ok', getRows:rows=>rows.filter(r=>r.variant_enabled==='Yes'&&parseFloat(r.calculated_price||0)<parseFloat(r.selling_price||0)),          field:'calculated_price',fieldLabel:'Variant price (R)',fieldType:'number', name:'Variant price ≥ base price',level:'err' },
+        { id:'no-zero-price',    getRows:rows=>rows.filter(r=>parseFloat(r.calculated_price||0)===0),                                                                field:'selling_price',   fieldLabel:'Price (R)',        fieldType:'number', name:'Zero prices',                   level:'warn'},
+        { id:'no-uncategorised', getRows:rows=>rows.filter(r=>!r.category||r.category.trim().toLowerCase()==='uncategorised'),                                       field:'category',        fieldLabel:'Category',         fieldType:'text',   name:'Uncategorised products',        level:'warn'},
+      ];
+
+      errorRules.forEach(rule=>{
+        const bad=rule.getRows(filteredData);
+        if(bad.length>0) _exportSteps.push({type:'fix', rule, bad});
+      });
+
+      // Case prices
+      const unresolvedCase=filteredData.filter(r=>(r.description||'').includes('[CASE PRICE')&&!r._caseApproved);
+      if(unresolvedCase.length>0) _exportSteps.push({type:'case', rows:unresolvedCase});
+
+      if(_exportSteps.length===0){
+        document.getElementById('warningModal').classList.add('open');
         return;
       }
+      _runExportStep(0);
+    }
 
-      const formData = new FormData();
-      formData.append("file", fileInput.files[0]);
+    function _runExportStep(idx){
+      _exportStepIdx=idx;
+      if(idx>=_exportSteps.length){
+        // All steps done
+        document.getElementById('fixModal').classList.remove('open');
+        document.getElementById('casePriceModal').classList.remove('open');
+        renderTable(); runVerification(); runDuplicateCheck();
+        document.getElementById('warningModal').classList.add('open');
+        return;
+      }
+      const step=_exportSteps[idx];
+      const totalSteps=_exportSteps.length;
+      const stepNum=idx+1;
 
-      status.textContent = "Uploading and processing...";
+      // Update step indicator
+      const stepPct=Math.round((idx/totalSteps)*100);
+      document.getElementById('fixModalStep').textContent='Step '+stepNum+' of '+totalSteps;
+      document.getElementById('fixModalStepFill').style.width=stepPct+'%';
 
-      try {
-        const response = await fetch(API_URL, { method: "POST", body: formData });
+      if(step.type==='fix'){
+        openFixModal(step.rule, {level:step.rule.level}, stepNum, totalSteps);
+      } else if(step.type==='case'){
+        document.getElementById('fixModal').classList.remove('open');
+        openCasePriceModal(step.rows);
+      }
+    }
 
-        if (!response.ok) {
-          let message = "Processing failed.";
-          try {
-            const error = await response.json();
-            message = error.error + (error.details ? `\n${error.details}` : "");
-          } catch (_) {}
-          status.textContent = message;
-          return;
+    document.getElementById('verifyExportBtn').onclick=triggerExport;
+    document.getElementById('verifyExportBtn').onclick=triggerExport;
+
+    // ── Process ────────────────────────────────────────────
+    document.getElementById('processBtn').onclick=async()=>{
+      const notes=document.getElementById('aiNotesInput').value.trim();
+
+      // Clear any previously loaded data from the right panel before starting
+      masterData=[]; rawItems=[]; filteredData=[]; Object.keys(_slugCount).forEach(k=>delete _slugCount[k]);
+      document.getElementById('resultsTable').classList.add('hidden');
+      document.getElementById('paginationControls').classList.add('hidden');
+      document.getElementById('controlsBar').classList.add('hidden');
+      document.getElementById('statsBar').classList.add('hidden');
+      document.getElementById('verifyPanel').classList.add('hidden');
+      document.getElementById('dupBanner').classList.add('hidden');
+      document.getElementById('statusMessage').classList.add('hidden');
+      document.getElementById('masterFilter').value='';
+
+      setLoading(true);
+      buildProgressUI(uploadedFiles);
+      const total=uploadedFiles.length;
+
+      try{
+        for(let idx=0;idx<uploadedFiles.length;idx++){
+          const f=uploadedFiles[idx];
+
+          // ── Spreadsheets: Render service (no Gemini rate-limit gap needed) ──
+          if(f.type==='render'){
+            updateProgressRow(idx,'active','Uploading to processor…',total);
+            const ok=await processViaRender(f,idx,total);
+            if(ok) continue;
+            // Service unreachable/failed — degrade to in-browser AI extraction so
+            // the user is never blocked by a cold or down Render instance.
+            showStatus('Processor unavailable for "'+f.name+'" — falling back to AI extraction.','info');
+            try{
+              f.textContent=await buildStructuredText(f.file,f.ext);
+              f.type='structured';
+            }catch(e){ updateProgressRow(idx,'error','Error',total); continue; }
+          }
+
+          // Use same wall-clock tracker for file-level gaps
+          { const sl=Date.now()-_lastApiCall; if(sl<7000) await new Promise(r=>setTimeout(r,7000-sl)); }
+          updateProgressRow(idx,'active','Scanning…',total);
+          try{
+            // ── Structured file pre-processing & chunking ─────────────────
+            // 1. Clean noisy data (long floats, pure-number rows)
+            // 2. Split by sheet boundary so column context is never lost
+            // 3. Sub-chunk sheets >500 lines
+            // 4. Batch small sheets together to reduce API calls
+            const MAX_SHEET_LINES=500;
+            const chunks=[];
+            if(f.type==='structured'&&f.textContent){
+              const rawLines=f.textContent.split(/[\n\r]+/);
+
+              // Pre-process: clean and filter lines
+              const cleanLine=l=>{
+                // Round long floating point numbers (e.g. 0.27500000000000002 → 0.28)
+                // to reduce token count without losing meaningful data
+                return l.replace(/(\d+\.\d{4,})/g,m=>parseFloat(m).toFixed(2));
+              };
+              const keepLine=l=>{
+                const parts=l.split('\t').map(p=>p.trim()).filter(Boolean);
+                if(!parts.length) return false;
+                // Drop rows that are only numbers (pure margin/calc artifacts)
+                const hasText=parts.some(p=>!/^-?[\d.,]+$/.test(p));
+                return hasText;
+              };
+
+              // Split into sheets, clean each line
+              const sheetMap=new Map(); // name → lines[]
+              let curSheet='## Sheet: (default)';
+              sheetMap.set(curSheet,[curSheet]); // always init default bucket
+              rawLines.forEach(l=>{
+                if(l.startsWith('## Sheet:')){
+                  curSheet=l;
+                  if(!sheetMap.has(curSheet)) sheetMap.set(curSheet,[l]);
+                } else if(keepLine(l)){
+                  sheetMap.get(curSheet)?.push(cleanLine(l));
+                }
+              });
+
+              // Build chunks: large sheets get sub-chunked, tiny sheets get batched
+              const rawChunks=[];
+              sheetMap.forEach((lines,sheetName)=>{
+                const header=lines[0]; // sheet name line
+                const data=lines.slice(1);
+                if(!data.length) return;
+                if(data.length<=MAX_SHEET_LINES){
+                  rawChunks.push({chars:lines.join('\n').length, text:lines.join('\n')});
+                } else {
+                  for(let si=0;si<data.length;si+=MAX_SHEET_LINES){
+                    const slice=data.slice(si,si+MAX_SHEET_LINES);
+                    const text=header+'\n'+slice.join('\n');
+                    rawChunks.push({chars:text.length, text});
+                  }
+                }
+              });
+
+              // Batch adjacent small chunks (< 6000 chars) to cut API calls
+              let batch='';
+              rawChunks.forEach(({chars,text})=>{
+                if(batch.length+chars<12000){ batch+=text+'\n\n'; }
+                else { if(batch.trim()) chunks.push(batch.trim()); batch=text+'\n\n'; }
+              });
+              if(batch.trim()) chunks.push(batch.trim());
+            } else {
+              chunks.push(f.textContent||null);
+            }
+            const allChunkItems=[];
+            for(let ci=0;ci<chunks.length;ci++){
+              // Enforce minimum 7s between API calls — stays under 10 RPM (6s minimum)
+              // _lastApiCall is module-level so it persists across all files
+              const sinceLast=Date.now()-_lastApiCall;
+              if(sinceLast<7000) await new Promise(r=>setTimeout(r,7000-sinceLast));
+              if(chunks.length>1){
+                updateProgressRow(idx,'active','Part '+(ci+1)+'/'+chunks.length,total);
+                // Update ring to show sub-progress within this file's segment
+                const fileBase=idx/total;
+                const fileSlice=1/total;
+                const chunkPct=fileBase+(fileSlice*(ci/chunks.length));
+                document.getElementById('scanRingFill').style.strokeDashoffset=(251*(1-chunkPct)).toFixed(1);
+                document.getElementById('scanNum').textContent=Math.round(chunkPct*100)+'%';
+                document.getElementById('scanTotal').textContent='';
+              }
+              const chunkNote=chunks.length>1?' [CHUNK '+(ci+1)+' OF '+chunks.length+': Extract all products from this section. Column headers are included. This is part of a larger file — do not duplicate items from other parts.]':'';
+              const parts=[{text:buildPrompt(parseMode,notes)+chunkNote}];
+              if(f.type==='image') parts.push({inlineData:{mimeType:'image/jpeg',data:f.base64}});
+              else if(f.type==='structured'&&chunks[ci]) parts.push({text:'SOURCE DATA (extract every row):\n'+chunks[ci]});
+
+              const data=await fetchWithRetry(
+                'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key='+apiKey,
+                {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contents:[{role:'user',parts}]})}
+              );
+              _lastApiCall=Date.now(); // record time of this call
+              const raw=data.candidates?.[0]?.content?.parts?.[0]?.text||'';
+              const match=raw.match(/\{[\s\S]*\}/);
+              if(match){
+                try{
+                  const chunkJson=JSON.parse(match[0]);
+                  if(chunkJson.items) allChunkItems.push(...chunkJson.items);
+                } catch(e){ /* malformed JSON in this chunk — skip */ }
+              }
+            } // end chunk loop
+
+            if(allChunkItems.length){
+              const json={items:allChunkItems};
+              if(json.items){
+                const allItems=json.items;
+                const totalItems=allItems.length;
+
+                // 1:1 ratio filter — detect non-product pages (images/PDFs only)
+                // Skip for structured files — we know spreadsheet data is product data.
+                // VARIANT SAFE: filters run on raw AI items BEFORE expandItem().
+                const pricedCount=allItems.filter(it=>parseFloat(it.selling_price||0)>0).length;
+                const ratioOk=f.type==='structured'||totalItems===0||(pricedCount/totalItems)>=0.4;
+
+                if(!ratioOk){
+                  updateProgressRow(idx,'done','Skipped — no product data detected',total);
+                } else {
+                  // Per-item filter: discard items with no price whose name looks like a sentence
+                  // (real product names are short; intro/heading text tends to be longer)
+                  const validItems=allItems.filter(item=>{
+                    const hasPrice=parseFloat(item.selling_price||0)>0;
+                    if(hasPrice) return true;
+                    // Has variants (attributes) = definitely a product regardless of price
+                    const hasVariants=(item.attributes||[]).length>0;
+                    if(hasVariants) return true;
+                    // No price, no variants — only keep if name is short (≤6 words)
+                    // Long names are likely sentences/headings from non-product pages
+                    const wordCount=(item.product_name||'').trim().split(/\s+/).length;
+                    return wordCount<=6;
+                  });
+                  const skipped=totalItems-validItems.length;
+                  const count=validItems.length;
+                  validItems.forEach(item=>{
+                    if(!item.category?.trim()) item.category='Uncategorised';
+                    // ── Case/pack price detection ─────────────────────────────
+                    // The AI may have stripped "x 12" from the product name into a Pack Size attribute.
+                    // We must check FOUR sources to catch every case price:
+                    //   1. product_name directly (e.g. "Gordons 200ml x 12")
+                    //   2. Pack Size attribute values the AI created (e.g. attribute label "x 12")
+                    //   3. description field (AI may have noted it there)
+                    //   4. Bracket notation rewrites: "(Pack of 12)", "(24 pack)", "24x", "12-pack"
+
+                    const detectedQty=_extractPackQty(item);
+                    if(detectedQty && detectedQty>=6){
+                      const packQty=detectedQty;
+                      const listedPrice=parseFloat(item.selling_price||0);
+                      if(listedPrice>0){
+                        item._casePrice=true;
+                        item._packQty=packQty;
+                        item._originalCasePrice=listedPrice;
+                        // Get the clean base name (strip x N and pack notation)
+                        const baseName=(item.product_name||'')
+                          .replace(/\s*x\s*\d+(?:\s*(?:pack|pcs|units?))?\s*/gi,' ')
+                          .replace(/\s*\((?:pack\s+of\s+)?\d+(?:\s*(?:pack|pcs|x))?\)\s*/gi,' ')
+                          .replace(/\s*\d+\s*x\b/gi,' ')
+                          .replace(/\s+/g,' ').trim();
+                        // Look for matching base product in rawItems
+                        const baseItem=rawItems.find(r=>{
+                          if(_extractPackQty(r)) return false; // skip other pack items
+                          const rName=(r.product_name||'').toLowerCase().trim();
+                          const bName=baseName.toLowerCase();
+                          return rName===bName || rName.includes(bName) || bName.includes(rName);
+                        });
+                        if(baseItem && parseFloat(baseItem.selling_price||0)>0){
+                          const basePrice=parseFloat(baseItem.selling_price);
+                          const correctedPrice=Math.round(basePrice*packQty*100)/100;
+                          item._basePrice=basePrice;
+                          item._correctedPrice=correctedPrice;
+                          item.description=(item.description?item.description+' ':'')+
+                            '[CASE PRICE CORRECTED: '+baseName+' unit=R'+basePrice.toFixed(2)+' × '+packQty+' = R'+correctedPrice.toFixed(2)+']';
+                        } else {
+                          item.description=(item.description?item.description+' ':'')+
+                            '[CASE PRICE — verify: R'+listedPrice.toFixed(2)+' listed for x'+packQty+'. Update if this is a case price.]';
+                        }
+                      }
+                    }
+                    rawItems.push(item);
+                    expandItem(item).forEach(row=>{ row._uid=Math.random().toString(36).slice(2); masterData.push(row); });
+                  });
+                  // ── Source reconciliation: catch x-qty items the AI renamed/stripped ──
+                  // Scan the raw source text for product names containing x N patterns.
+                  // For any that the AI returned without flagging as case prices, flag them now.
+                  if(f.type==='structured' && f.textContent){
+                    const srcLines=f.textContent.split(/[\n\r]+/);
+                    srcLines.forEach(line=>{
+                      // Find cells in this line that contain x N patterns
+                      const cells=line.split(/\t|,(?=(?:[^"]*"[^"]*")*[^"]*$)/);
+                      cells.forEach(cell=>{
+                        const cellTrim=cell.trim().replace(/^"|"$/g,'');
+                        const xm=cellTrim.match(/(?<![0-9])x\s*(\d+)(?:\s*(?:pack|pcs|units?))?\b/i);
+                        if(!xm || parseInt(xm[1])<6) return;
+                        // This source cell had an x-qty pattern.
+                        // Strip x N to get base name for fuzzy match
+                        const srcBase=cellTrim
+                          .replace(/\s*x\s*\d+(?:\s*(?:pack|pcs|units?))?\s*/gi,' ')
+                          .replace(/\s+/g,' ').trim().toLowerCase();
+                        if(srcBase.length<2) return;
+                        // Find the matching item in rawItems that doesn't have _casePrice yet
+                        rawItems.forEach(item=>{
+                          if(item._casePrice) return; // already flagged
+                          const iName=(item.product_name||'').toLowerCase();
+                          // Match if: item name contains the source base, or source base contains item name
+                          const nameMatch=iName===srcBase ||
+                            iName.includes(srcBase) ||
+                            srcBase.includes(iName) ||
+                            // Also match if source cell is contained in item name (AI may have kept full name)
+                            iName.includes(cellTrim.toLowerCase());
+                          if(!nameMatch) return;
+                          // Flag this item as case price using source data
+                          const packQty=parseInt(xm[1]);
+                          const listedPrice=parseFloat(item.selling_price||0);
+                          if(listedPrice>0){
+                            item._casePrice=true;
+                            item._packQty=packQty;
+                            item._originalCasePrice=listedPrice;
+                            // Look for base product
+                            const baseItem=rawItems.find(r=>{
+                              if(r._casePrice||r===item) return false;
+                              const rn=(r.product_name||'').toLowerCase().trim();
+                              return rn===srcBase||rn.includes(srcBase)||srcBase.includes(rn);
+                            });
+                            if(baseItem && parseFloat(baseItem.selling_price||0)>0){
+                              const bp=parseFloat(baseItem.selling_price);
+                              const cp=Math.round(bp*packQty*100)/100;
+                              item._basePrice=bp; item._correctedPrice=cp;
+                              item.description=(item.description?item.description+' ':'')+
+                                '[CASE PRICE CORRECTED: '+srcBase+' unit=R'+bp.toFixed(2)+' × '+packQty+' = R'+cp.toFixed(2)+']';
+                            } else {
+                              item.description=(item.description?item.description+' ':'')+
+                                '[CASE PRICE — verify: R'+listedPrice.toFixed(2)+' listed for x'+packQty+'. Update if this is a case price.]';
+                            }
+                          }
+                        });
+                      });
+                    });
+                    // Also apply flags to expanded masterData rows
+                    masterData.forEach(row=>{
+                      const src=rawItems.find(r=>r.product_name&&row.product_name&&
+                        r.product_name.toLowerCase()===row.product_name.toLowerCase()&&
+                        r._casePrice);
+                      if(src && !row._casePrice){
+                        row._casePrice=true;
+                        row._packQty=src._packQty;
+                        row._originalCasePrice=src._originalCasePrice;
+                        row._basePrice=src._basePrice;
+                        row._correctedPrice=src._correctedPrice;
+                        row.description=src.description;
+                      }
+                    });
+                  }
+
+                  const note=skipped>0?' ('+skipped+' non-product row'+(skipped>1?'s':'')+' skipped)':'';
+                  updateProgressRow(idx,'done',count+' item'+(count!==1?'s':'')+' found'+note,total);
+                }
+              } else { updateProgressRow(idx,'done','No items found',total); }
+            } // end allChunkItems
+            if(!allChunkItems.length){ updateProgressRow(idx,'done','No items found',total); }
+          } catch(fileErr){
+            console.error('File error:',fileErr);
+            updateProgressRow(idx,'error','Error',total);
+            showStatus('Error on "'+f.name+'": '+fileErr.message,'error');
+          }
         }
 
-        const blob = await response.blob();
-        const downloadUrl = window.URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = downloadUrl;
-        a.download = fileInput.files[0].name.replace(/\.[^.]+$/, "") + "_yoco_import_ready.xlsx";
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        window.URL.revokeObjectURL(downloadUrl);
-        status.textContent = "Done. Your processed file should be downloading.";
-      } catch (error) {
-        status.textContent = "Could not reach the API. Check the Render URL and CORS settings.\n" + error.message;
+        // Complete the ring
+        document.getElementById('scanRingFill').style.strokeDashoffset='0';
+        document.getElementById('scanNum').textContent=total;
+        document.getElementById('scanLabel').textContent='Done';
+        document.getElementById('scanFilename').textContent=masterData.length+' products extracted';
+
+        await saveToFirestore();
+        showStatus('Extracted '+masterData.length+' rows from '+total+' file'+(total!==1?'s':'')+'.','success');
+        currentPage=1; renderTable(); runVerification(); runDuplicateCheck();
+
+      } catch(e){ console.error(e); showStatus('Extraction error — check file format or try again.','error'); }
+      finally{ setLoading(false); }
+    };
+
+    // ── Table ──────────────────────────────────────────────
+    function renderTable(){
+      const search=document.getElementById('masterFilter').value.toLowerCase();
+      filteredData=masterData.filter(i=>(i.product_name+(i.category||'')).toLowerCase().includes(search));
+      const totalPages=Math.max(1,Math.ceil(filteredData.length/rowsPerPage));
+      if(currentPage>totalPages) currentPage=totalPages;
+      const pageData=filteredData.slice((currentPage-1)*rowsPerPage,currentPage*rowsPerPage);
+      const tbody=document.getElementById('tableBody'); tbody.innerHTML='';
+      const hasData=filteredData.length>0;
+      document.getElementById('resultsTable').classList.toggle('hidden',!hasData);
+      document.getElementById('emptyState').classList.toggle('hidden',hasData);
+      if(hasData) document.getElementById('scanState').classList.add('hidden');
+      document.getElementById('controlsBar').classList.toggle('hidden',!masterData.length);
+      document.getElementById('paginationControls').classList.toggle('hidden',!hasData);
+      document.getElementById('statsBar').classList.toggle('hidden',!masterData.length);
+      if(masterData.length){
+        document.getElementById('statTotal').textContent=masterData.length;
+        document.getElementById('statVariants').textContent=masterData.filter(r=>r.variant_enabled==='Yes').length;
+        document.getElementById('statCategories').textContent=new Set(masterData.map(r=>r.category)).size;
+      }
+      pageData.forEach(i=>{
+        const tr=document.createElement('tr');
+        const vars=[i.attr1_val,i.attr2_val,i.attr3_val].filter(Boolean).join(' · ');
+        const badge=i.variant_enabled==='Yes'
+          ?'<span class="badge badge-brand"><span class="badge-dot"></span>Variant</span>'
+          :'<span class="badge badge-neutral"><span class="badge-dot"></span>Single</span>';
+        const issues=i._issues||[];
+        const dupFlag=i._isDup;
+        const caseFlag=(i.description||'').includes('[CASE PRICE');
+        const caseApproved=i._caseApproved===true;
+        let issueCell='<span style="color:var(--content-tertiary);font-size:12px">—</span>';
+        if(issues.includes('err')) issueCell='<span class="badge badge-error"><span class="badge-dot"></span>Error</span>';
+        else if(issues.includes('warn')&&!caseFlag) issueCell='<span class="badge badge-warn"><span class="badge-dot"></span>Warning</span>';
+        else if(dupFlag) issueCell='<span style="display:flex;align-items:center;gap:6px"><span class="badge" style="background:var(--yds-orange-40);color:var(--yds-orange-540)"><span class="badge-dot"></span>Duplicate</span><button class="btn-remove-row" data-uid="'+i._uid+'">Remove</button></span>';
+        else if(caseFlag){
+          if(caseApproved){
+            // Already approved — show confirmation
+            issueCell='<span class="case-approved">'
+              +'<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>'
+              +'R'+parseFloat(i.calculated_price||i.selling_price||0).toFixed(2)+' approved'
+              +'</span>';
+          } else {
+            // Show suggestion card with approve / dismiss
+            const hasBase=(i.description||'').includes('CORRECTED');
+            const suggestedPrice=hasBase
+              ? i._correctedPrice||i._basePrice*(i._packQty||1)
+              : (i._packQty||1)*(i._originalCasePrice||parseFloat(i.selling_price||0));
+            const suggestedLabel=hasBase
+              ? 'R'+parseFloat(i._originalCasePrice||0).toFixed(2)+' × '+i._packQty+' = R'+parseFloat(suggestedPrice).toFixed(2)
+              : 'Listed R'+parseFloat(i._originalCasePrice||i.selling_price||0).toFixed(2)+' × '+i._packQty+' = R'+parseFloat(suggestedPrice).toFixed(2);
+            issueCell='<div class="case-price-cell">'
+              +'<div class="case-price-suggestion">'
+                +'<span class="case-price-label">×'+i._packQty+'</span>'
+                +'<span class="case-price-value">R'+parseFloat(suggestedPrice).toFixed(2)+'</span>'
+                +'<button class="btn-approve" data-uid="'+i._uid+'" data-price="'+parseFloat(suggestedPrice).toFixed(2)+'">Approve</button>'
+                +'<button class="btn-dismiss-case" data-uid="'+i._uid+'">Keep R'+parseFloat(i._originalCasePrice||i.selling_price||0).toFixed(2)+'</button>'
+              +'</div>'
+            +'</div>';
+          }
+        }
+
+        if(issues.includes('err')) tr.classList.add('row-error');
+        else if(issues.includes('warn')&&!caseFlag) tr.classList.add('row-warn');
+        else if(dupFlag) tr.classList.add('row-dup');
+        else if(caseFlag&&!caseApproved) tr.classList.add('row-case');
+
+        tr.innerHTML=
+          '<td class="td-cat">'+(i.category||'—')+'</td>'+
+          '<td style="font-weight:500">'+(i.product_name||'')+'</td>'+
+          '<td>'+badge+'</td>'+
+          '<td class="td-var">'+(vars||'—')+'</td>'+
+          '<td class="td-price">R '+parseFloat(i.calculated_price||0).toFixed(2)+'</td>'+
+          '<td>'+issueCell+'</td>';
+
+        // Wire up remove button
+        const removeBtn=tr.querySelector('.btn-remove-row');
+        if(removeBtn){
+          removeBtn.onclick=(e)=>{
+            e.stopPropagation();
+            const uid=removeBtn.dataset.uid;
+            masterData=masterData.filter(r=>r._uid!==uid);
+            currentPage=1; renderTable(); runVerification(); runDuplicateCheck();
+            showStatus('Row removed. '+masterData.length+' rows remaining.','info');
+          };
+        }
+
+        // Wire up case price approve button
+        const approveBtn=tr.querySelector('.btn-approve');
+        if(approveBtn){
+          approveBtn.onclick=(e)=>{
+            e.stopPropagation();
+            const uid=approveBtn.dataset.uid;
+            const approvedPrice=parseFloat(approveBtn.dataset.price);
+            const row=masterData.find(r=>r._uid===uid);
+            if(row){
+              row.selling_price=approvedPrice;
+              row.calculated_price=approvedPrice;
+              row._caseApproved=true;
+              // Clean the flag from description so verify rule clears
+              row.description=(row.description||'').replace(/\[CASE PRICE[^\]]*\]/g,'').trim();
+              renderTable(); runVerification();
+              showStatus('Case price approved — R'+approvedPrice.toFixed(2)+' set for '+row.product_name,'success');
+            }
+          };
+        }
+
+        // Wire up case price dismiss button
+        const dismissBtn=tr.querySelector('.btn-dismiss-case');
+        if(dismissBtn){
+          dismissBtn.onclick=(e)=>{
+            e.stopPropagation();
+            const uid=dismissBtn.dataset.uid;
+            const row=masterData.find(r=>r._uid===uid);
+            if(row){
+              row._caseApproved=true; // dismiss also clears the flag
+              row.description=(row.description||'').replace(/\[CASE PRICE[^\]]*\]/g,'').trim();
+              renderTable(); runVerification();
+              showStatus('Case price dismissed — keeping listed price for '+row.product_name,'info');
+            }
+          };
+        }
+
+        tbody.appendChild(tr);
+      });
+      document.getElementById('pageIndicator').textContent='Page '+currentPage+' of '+totalPages+' ('+filteredData.length+' items)';
+      document.getElementById('prevPageBtn').disabled=currentPage===1;
+      document.getElementById('nextPageBtn').disabled=currentPage===totalPages;
+    }
+
+    document.getElementById('masterFilter').oninput=()=>{currentPage=1;renderTable();};
+    document.getElementById('rowsPerPageSelect').onchange=e=>{rowsPerPage=parseInt(e.target.value);currentPage=1;renderTable();};
+    document.getElementById('prevPageBtn').onclick=()=>{if(currentPage>1){currentPage--;renderTable();}};
+    document.getElementById('nextPageBtn').onclick=()=>{const tp=Math.ceil(filteredData.length/rowsPerPage);if(currentPage<tp){currentPage++;renderTable();}};
+
+    // ── Track stock ────────────────────────────────────────
+    document.getElementById('trackStockToggle').onclick=function(){
+      trackStockEnabled=!trackStockEnabled;
+      this.classList.toggle('on',trackStockEnabled);
+      document.getElementById('trackStockLabel').textContent=trackStockEnabled?'On':'Off';
+      this.setAttribute('aria-pressed',trackStockEnabled);
+    };
+
+    // ── Export ─────────────────────────────────────────────
+    document.getElementById('cancelDownload').onclick=()=>document.getElementById('warningModal').classList.remove('open');
+    function doExport(){
+      // vatEnabled reflects the chip state — if the VAT chip is active the user confirmed prices are VAT-inclusive
+      const vatChipActive=document.querySelector('.chip[data-instruction="vat"]')?.classList.contains('active');
+      const vatEnabled=vatChipActive?'Yes':'No';
+      // Yoco rule: Default Price must be IDENTICAL across all variant rows of the same product.
+      // It must equal the lowest (base) price for the product group.
+      // Build a map of product_id → minimum selling_price across all variant rows.
+      const productBasePrice={};
+      filteredData.forEach(i=>{
+        const pid=i.product_id;
+        const price=parseFloat(i.selling_price||0);
+        if(i.variant_enabled==='Yes'){
+          if(productBasePrice[pid]===undefined || price < productBasePrice[pid]){
+            productBasePrice[pid]=price;
+          }
+        }
+      });
+
+      const rows=filteredData.map(i=>{ const isV=i.variant_enabled==='Yes';
+        // For variants: Default Price = minimum price in the group (Yoco requires all rows identical)
+        // For singles: Default Price = that item's selling_price
+        const defaultPrice=isV
+          ? (productBasePrice[i.product_id]||parseFloat(i.selling_price||0))
+          : parseFloat(i.selling_price||0);
+        return[
+        i.product_id,          // Product ID
+        i.product_name,        // Product Name
+        i.description||'',     // Description
+        defaultPrice.toFixed(2), // Default Price — MUST be identical for all rows of same product
+        '',                    // Brand
+        i.category||'Uncategorised', // Category
+        '',                    // SKU (leave blank — barcode goes in Barcode column only)
+        '0.00',                // Default Cost Price
+        '',                    // Ask For Quantity — blank = Yoco default
+        '1',                   // Default Quantity
+        '',                    // Quantity Units
+        '',                    // Ask For Price — blank = Yoco default
+        vatEnabled,            // VAT Enabled — respects chip state
+        parseFloat(i.calculated_price||0).toFixed(2), // Variant Price — per-variant actual price
+        isV?'yes':'No',        // Variant Enabled
+        i.attr1_name||'',i.attr1_val||'', // Attribute 1 / Value 1
+        i.attr2_name||'',i.attr2_val||'', // Attribute 2 / Value 2
+        i.attr3_name||'',i.attr3_val||'', // Attribute 3 / Value 3
+        i.image_url||'',       // Image URL
+        i.barcode||'',         // Barcode (correct column)
+        trackStockEnabled?(isV?'Variant':'Product'):'No', // Track Stock
+        ''                     // Modifier Group
+      ]; });
+      const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet([standardHeader,...rows]),'Products');
+      const name=document.getElementById('clientNameInput').value.trim()||'Retail';
+      XLSX.writeFile(wb,name+'_Yoco_'+(parseMode==='single'?'Single':'Variant')+'_Export.xlsx');
+      document.getElementById('warningModal').classList.remove('open');
+    }
+    document.getElementById('confirmDownload').onclick=doExport;
+
+    // ── Error fix modal ───────────────────────────────────────────────────
+    function openFixModal(rule, result, stepNum, totalSteps){
+      const badRows=rule.getRows(masterData);
+      document.getElementById('fixModalTitle').textContent='Fix: '+rule.name;
+      document.getElementById('fixModalSubtitle').textContent=
+        badRows.length+' item'+(badRows.length>1?'s need':' needs')+' attention. Edit and click Apply, then proceed.';
+      // Update step bar if part of export flow
+      if(stepNum&&totalSteps){
+        document.getElementById('fixModalStep').textContent='Step '+stepNum+' of '+totalSteps;
+        const pct=Math.round(((stepNum-1)/totalSteps)*100);
+        document.getElementById('fixModalStepFill').style.width=pct+'%';
+        document.getElementById('fixModalProceed').textContent=stepNum<totalSteps?'Next →':'Review & export';
+      } else {
+        document.getElementById('fixModalStep').textContent='';
+        document.getElementById('fixModalStepFill').style.width='0%';
+        document.getElementById('fixModalProceed').textContent='Done';
+      }
+
+      const list=document.getElementById('fixModalList');
+      list.innerHTML='';
+
+      badRows.forEach(row=>{
+        const currentVal=row[rule.field]||'';
+        const issueDesc=
+          rule.id==='no-zero-price'||rule.id==='no-negative-price' ? 'Price is R'+parseFloat(row.calculated_price||0).toFixed(2) :
+          rule.id==='variant-price-ok' ? 'Variant R'+parseFloat(row.calculated_price||0).toFixed(2)+' < base R'+parseFloat(row.selling_price||0).toFixed(2) :
+          rule.id==='no-uncategorised' ? 'Category is "'+row.category+'"' :
+          rule.id==='no-empty-name' ? 'Name is empty' :
+          'Issue detected';
+
+        const d=document.createElement('div');
+        d.className='fix-modal-row'; d.id='fmr-'+row._uid;
+        d.innerHTML=
+          '<div class="fix-modal-name">'+(row.product_name||'(no name)')+(row.attr1_val?' · '+row.attr1_val:'')+'</div>'+
+          '<div class="fix-modal-issue">'+
+            '<span class="vr-dot '+(result.level==='err'?'err':'warn')+'" style="flex-shrink:0"></span>'+
+            issueDesc+
+          '</div>'+
+          '<div class="fix-modal-field">'+
+            '<span class="fix-modal-label">'+rule.fieldLabel+':</span>'+
+            '<input class="fix-modal-input" type="'+(rule.fieldType||'text')+'" value="'+currentVal+'" data-uid="'+row._uid+'" data-field="'+rule.field+'">'+
+            '<button class="btn-fix-apply" data-uid="'+row._uid+'" data-field="'+rule.field+'">Apply</button>'+
+          '</div>';
+        list.appendChild(d);
+      });
+
+      updateFixModalProgress();
+      document.getElementById('fixModal').classList.add('open');
+    }
+
+    function updateFixModalProgress(){
+      const total=document.querySelectorAll('.fix-modal-row').length;
+      const resolved=document.querySelectorAll('.fix-modal-row.resolved').length;
+      const p=document.getElementById('fixModalProgress');
+      p.textContent=resolved+' of '+total+' fixed'+(resolved===total?' — ready to export':'');
+      p.style.color=resolved===total?'var(--yds-green-690)':'var(--content-secondary)';
+    }
+
+    document.getElementById('fixModalList').addEventListener('click', e=>{
+      const applyBtn=e.target.closest('.btn-fix-apply');
+      if(!applyBtn) return;
+      const uid=applyBtn.dataset.uid;
+      const field=applyBtn.dataset.field;
+      const input=document.querySelector('.fix-modal-input[data-uid="'+uid+'"]');
+      if(!input) return;
+      const newVal=input.value.trim();
+      const row=masterData.find(r=>r._uid===uid);
+      if(row && newVal){
+        // Apply to the row
+        if(field==='selling_price'||field==='calculated_price'){
+          const num=parseFloat(newVal);
+          if(!isNaN(num)){
+            row.selling_price=num;
+            row.calculated_price=num;
+          }
+        } else {
+          row[field]=newVal;
+          // If fixing category, apply to all rows with the same product_id
+          if(field==='category'){
+            masterData.filter(r=>r.product_id===row.product_id).forEach(r=>r[field]=newVal);
+          }
+        }
+        // Mark row as resolved in modal
+        const el=document.getElementById('fmr-'+uid);
+        if(el) el.classList.add('resolved');
+        updateFixModalProgress();
       }
     });
-  </script>
+
+    // Allow Enter key on inputs
+    document.getElementById('fixModalList').addEventListener('keydown', e=>{
+      if(e.key==='Enter'){
+        const btn=e.target.closest('.fix-modal-field')?.querySelector('.btn-fix-apply');
+        if(btn) btn.click();
+      }
+    });
+
+    document.getElementById('fixModalProceed').onclick=()=>{
+      if(_exportSteps.length>0 && _exportStepIdx<_exportSteps.length){
+        // In export flow — advance to next step
+        document.getElementById('fixModal').classList.remove('open');
+        renderTable(); runVerification();
+        _runExportStep(_exportStepIdx+1);
+      } else {
+        // Opened from verify panel Fix button — just close and refresh
+        document.getElementById('fixModal').classList.remove('open');
+        renderTable(); runVerification(); runDuplicateCheck();
+      }
+    };
+    document.getElementById('fixModalCancel').onclick=()=>{
+      document.getElementById('fixModal').classList.remove('open');
+      _exportSteps=[]; _exportStepIdx=0; // abort export flow
+    };
+
+    // ── Case price review modal ────────────────────────────────────────────
+    function openCasePriceModal(unresolvedRows){
+      const list=document.getElementById('casePriceModalList');
+      list.innerHTML='';
+      document.getElementById('casePriceModalSubtitle').textContent=
+        unresolvedRows.length+' product'+(unresolvedRows.length>1?'s have':' has')+' pack pricing — approve the suggested price or keep the original before exporting.';
+
+      unresolvedRows.forEach(row=>{
+        const hasBase=(row.description||'').includes('CORRECTED');
+        const listedPrice=parseFloat(row._originalCasePrice||row.selling_price||0);
+        const qty=row._packQty||1;
+        const suggestedPrice=hasBase
+          ? parseFloat(row._correctedPrice||listedPrice)
+          : Math.round(listedPrice*qty*100)/100;
+
+        const d=document.createElement('div');
+        d.className='case-modal-row'; d.id='cmr-'+row._uid;
+        d.innerHTML=
+          '<div class="case-modal-name">'+row.product_name+'</div>'+
+          '<div class="case-modal-detail">'+
+            'Listed: <strong>R'+listedPrice.toFixed(2)+'</strong> for ×'+qty+' units &nbsp;→&nbsp; '+
+            'Suggested unit price: <strong>R'+(listedPrice/qty).toFixed(2)+'</strong> &nbsp;or&nbsp; '+
+            'Case total: <strong>R'+suggestedPrice.toFixed(2)+'</strong>'+
+          '</div>'+
+          '<div class="case-modal-actions">'+
+            '<span class="case-modal-price suggested">R'+suggestedPrice.toFixed(2)+'</span>'+
+            '<button class="btn-approve cm-approve" data-uid="'+row._uid+'" data-price="'+suggestedPrice.toFixed(2)+'">✓ Approve R'+suggestedPrice.toFixed(2)+'</button>'+
+            '<button class="btn-dismiss-case cm-dismiss" data-uid="'+row._uid+'" data-price="'+listedPrice.toFixed(2)+'">Keep R'+listedPrice.toFixed(2)+'</button>'+
+          '</div>';
+        list.appendChild(d);
+      });
+
+      updateCaseModalProgress();
+      document.getElementById('casePriceModal').classList.add('open');
+    }
+
+    function updateCaseModalProgress(){
+      const total=document.querySelectorAll('.case-modal-row').length;
+      const resolved=document.querySelectorAll('.case-modal-row.resolved').length;
+      const prog=document.getElementById('casePriceModalProgress');
+      prog.textContent=resolved+' of '+total+' reviewed'+(resolved===total?' — ready to export':'');
+      prog.style.color=resolved===total?'var(--yds-green-690)':'var(--content-secondary)';
+    }
+
+    function resolveCaseRow(uid, approvedPrice){
+      const row=masterData.find(r=>r._uid===uid);
+      if(row){
+        row.selling_price=approvedPrice;
+        row.calculated_price=approvedPrice;
+        row._caseApproved=true;
+        row.description=(row.description||'').replace(/\[CASE PRICE[^\]]*\]/g,'').trim();
+      }
+      const el=document.getElementById('cmr-'+uid);
+      if(el) el.classList.add('resolved');
+      updateCaseModalProgress();
+    }
+
+    document.getElementById('casePriceModalList').addEventListener('click', e=>{
+      const approveBtn=e.target.closest('.cm-approve');
+      const dismissBtn=e.target.closest('.cm-dismiss');
+      if(approveBtn){
+        resolveCaseRow(approveBtn.dataset.uid, parseFloat(approveBtn.dataset.price));
+      } else if(dismissBtn){
+        resolveCaseRow(dismissBtn.dataset.uid, parseFloat(dismissBtn.dataset.price));
+      }
+    });
+
+    document.getElementById('caseApproveAllBtn').onclick=()=>{
+      document.querySelectorAll('.cm-approve:not(.case-modal-row.resolved .cm-approve)').forEach(btn=>{
+        if(!document.getElementById('cmr-'+btn.dataset.uid)?.classList.contains('resolved')){
+          resolveCaseRow(btn.dataset.uid, parseFloat(btn.dataset.price));
+        }
+      });
+    };
+
+    document.getElementById('caseDismissAllBtn').onclick=()=>{
+      document.querySelectorAll('.cm-dismiss:not(.case-modal-row.resolved .cm-dismiss)').forEach(btn=>{
+        if(!document.getElementById('cmr-'+btn.dataset.uid)?.classList.contains('resolved')){
+          resolveCaseRow(btn.dataset.uid, parseFloat(btn.dataset.price));
+        }
+      });
+    };
+
+    document.getElementById('caseProceedBtn').onclick=()=>{
+      document.getElementById('casePriceModal').classList.remove('open');
+      renderTable(); runVerification();
+      if(_exportSteps.length>0){
+        // In export flow — advance to next step
+        _runExportStep(_exportStepIdx+1);
+      } else {
+        document.getElementById('warningModal').classList.add('open');
+      }
+    };
+
+    document.getElementById('caseCancelBtn').onclick=()=>{
+      document.getElementById('casePriceModal').classList.remove('open');
+      _exportSteps=[]; _exportStepIdx=0; // abort export flow
+    };
+
+    // ── Utils ──────────────────────────────────────────────
+    function setLoading(is){
+      document.getElementById('btnText').textContent=is?'Extracting…':'Scan & extract';
+      document.getElementById('btnLoader').classList.toggle('hidden',!is);
+      document.getElementById('processBtn').disabled=is;
+    }
+    function showStatus(msg,type){ const el=document.getElementById('statusMessage'); el.textContent=msg; el.classList.remove('hidden'); el.className='status status-'+type; }
+  };
+
+  init();
+</script>
 </body>
 </html>

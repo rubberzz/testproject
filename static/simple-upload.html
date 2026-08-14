@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Yoco Retail Import Processor</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 20px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 24px; }
+    button { padding: 10px 16px; cursor: pointer; }
+    #status { margin-top: 16px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Yoco Retail Import Processor</h1>
+    <p>Upload a supplier Excel/CSV file and download a Yoco-ready workbook with an Issues tab.</p>
+    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" />
+    <button id="processButton">Process file</button>
+    <div id="status"></div>
+  </div>
+
+  <script>
+    // For local testing use: http://127.0.0.1:10000/process-retail-file
+    // After deployment, replace this with your Render URL:
+    const API_URL = "https://YOUR-RENDER-SERVICE.onrender.com/process-retail-file";
+
+    document.getElementById("processButton").addEventListener("click", async () => {
+      const fileInput = document.getElementById("fileInput");
+      const status = document.getElementById("status");
+
+      if (!fileInput.files.length) {
+        status.textContent = "Please choose a file first.";
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append("file", fileInput.files[0]);
+
+      status.textContent = "Uploading and processing...";
+
+      try {
+        const response = await fetch(API_URL, { method: "POST", body: formData });
+
+        if (!response.ok) {
+          let message = "Processing failed.";
+          try {
+            const error = await response.json();
+            message = error.error + (error.details ? `\n${error.details}` : "");
+          } catch (_) {}
+          status.textContent = message;
+          return;
+        }
+
+        const blob = await response.blob();
+        const downloadUrl = window.URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = downloadUrl;
+        a.download = fileInput.files[0].name.replace(/\.[^.]+$/, "") + "_yoco_import_ready.xlsx";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.URL.revokeObjectURL(downloadUrl);
+        status.textContent = "Done. Your processed file should be downloading.";
+      } catch (error) {
+        status.textContent = "Could not reach the API. Check the Render URL and CORS settings.\n" + error.message;
+      }
+    });
+  </script>
+</body>
+</html>
