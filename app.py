@@ -12,7 +12,7 @@ from flask_cors import CORS
 
 
 app = Flask(__name__)
-APP_VERSION = "2026-06-19-drive-ai-v2"
+APP_VERSION = "2026-08-14-plan-audit-registry-v3"
 
 # Explicit CORS for browser/blob origins used by the dashboard preview.
 # This prevents opaque "TypeError: Failed to fetch" failures when the
@@ -172,6 +172,21 @@ def compact_conflict_for_frontend(conflict: Dict[str, Any]) -> Dict[str, Any]:
 def handle_unexpected_error(exc):
     # Always return JSON + CORS instead of letting the connection die silently.
     import traceback
+    from werkzeug.exceptions import HTTPException
+
+    # A 404 or a 413 (upload too large) is not a crash. Passing them through the
+    # 500 branch made routing mistakes and oversized uploads look like backend
+    # failures, which sent debugging in the wrong direction.
+    if isinstance(exc, HTTPException):
+        payload = {
+            "error": exc.description,
+            "type": exc.__class__.__name__,
+            "status": exc.code,
+        }
+        if exc.code == 413:
+            payload["hint"] = f"Upload limit is {MAX_UPLOAD_MB} MB. Split the workbook or raise MAX_UPLOAD_MB."
+        return cors_json(payload, exc.code or 500)
+
     app.logger.exception("Unhandled backend error")
     return cors_json({
         "error": str(exc),
@@ -180,7 +195,7 @@ def handle_unexpected_error(exc):
     }, 500)
 
 
-MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "50"))
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "32"))
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 
 # Lightweight in-memory store for conflict choices from the frontend.
@@ -544,6 +559,59 @@ def parse_money(value: Any) -> float:
         return round(float(text), 2)
     except ValueError:
         return 0.0
+
+
+def parse_money_opt(value: Any) -> Optional[float]:
+    """Like parse_money, but returns None when the cell has no numeric content.
+
+    parse_money() returns 0.0 for junk, which makes "is this row a product?"
+    checks impossible: header remnants, TOTAL rows and category headings all look
+    like R0.00 products. The AI-plan executor uses this variant so that a missing
+    price is distinguishable from a real price of zero.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and math.isnan(value):
+            return None
+        return round(float(value), 2)
+
+    text = normalise_text(value)
+    if not text:
+        return None
+    if not re.search(r"\d", text):
+        return None
+
+    # A price cell is mostly digits. "Amstel Lager 660ml" contains digits but is a
+    # product name; stripping non-numerics out of it (as parse_money does) would
+    # yield a bogus price of 660 and make every name column look like a price
+    # column. Reject anything carrying real words or unit suffixes.
+    letters = re.sub(r"[^A-Za-z]", "", text.replace("R", "").replace("r", ""))
+    if len(letters) > 3:
+        return None
+    if re.search(r"\d\s*(ml|cl|l|kg|mg|g|pcs|pack|x)\b", text, re.IGNORECASE):
+        return None
+
+    text = text.replace("R", "").replace("r", "")
+    text = text.replace(" ", "").replace("\u00a0", "")
+    if "," in text and "." not in text:
+        text = text.replace(",", ".")
+    else:
+        text = text.replace(",", "")
+    text = re.sub(r"[^0-9.\-]", "", text)
+    if text in {"", "-", "."}:
+        return None
+    try:
+        return round(float(text), 2)
+    except ValueError:
+        return None
+
+
+def looks_like_money_cell(value: Any) -> bool:
+    parsed = parse_money_opt(value)
+    return parsed is not None
 
 
 def clean_code(value: Any) -> str:
@@ -3144,39 +3212,110 @@ def safe_jsonable(value: Any) -> Any:
     return str(value)
 
 
-def workbook_sample_from_bytes(raw_bytes: bytes, ext: str, max_rows: int = 60, max_cols: int = 18) -> Dict[str, Any]:
+def read_all_sheets_from_bytes(raw_bytes: bytes, ext: str) -> Dict[str, pd.DataFrame]:
+    """Single place that turns uploaded bytes into raw, header-less DataFrames."""
+    if ext == "csv":
+        return {"CSV": pd.read_csv(io.BytesIO(raw_bytes), dtype=object, header=None)}
+    engine = "openpyxl" if ext in {"xlsx", "xlsm"} else None
+    return pd.read_excel(io.BytesIO(raw_bytes), sheet_name=None, dtype=object, header=None, engine=engine)
+
+
+def last_used_column(df: pd.DataFrame, cap: int = 60) -> int:
+    """Number of columns that actually contain data, capped for prompt size.
+
+    The old sampler hard-stopped at column R (18). Shopify-shaped exports keep
+    their variant/option columns well past that, so the planner never saw them.
+    """
+    ncols = min(len(df.columns), cap)
+    last = 0
+    for c in range(ncols):
+        col = df.iloc[:, c]
+        if col.notna().any() and any(cell_to_text(v) for v in col.head(400)):
+            last = c + 1
+    return max(last, min(ncols, 8))
+
+
+def sample_row_windows(nrows: int, head: int = 40, mid: int = 12, tail: int = 10) -> List[range]:
+    """Head + two mid-file windows + tail.
+
+    A workbook that starts a second table at row 300, or switches category block
+    halfway down, is invisible to a head-only sample. Row numbers stay absolute so
+    the plan's header_row/start_row remain valid against the real sheet.
+    """
+    if nrows <= head + tail:
+        return [range(0, nrows)]
+    windows = [range(0, head)]
+    for fraction in (0.4, 0.7):
+        start = int(nrows * fraction)
+        start = max(head, min(start, nrows - tail - mid))
+        if start >= head:
+            windows.append(range(start, min(start + mid, nrows - tail)))
+    windows.append(range(max(0, nrows - tail), nrows))
+
+    merged: List[range] = []
+    for window in sorted(windows, key=lambda w: w.start):
+        if merged and window.start <= merged[-1].stop:
+            merged[-1] = range(merged[-1].start, max(merged[-1].stop, window.stop))
+        else:
+            merged.append(window)
+    return [w for w in merged if len(w) > 0]
+
+
+def workbook_sample_from_bytes(raw_bytes: bytes, ext: str, max_rows: int = 60, max_cols: int = 60) -> Dict[str, Any]:
     """Create a compact, model-friendly representation of the workbook.
 
-    This is intentionally small: sheet names, row/column coordinates and values
-    for the first rows only. Python still processes the full workbook later.
+    Sheet names plus row/column coordinates for a head window, two mid-file
+    windows and a tail window. Python still processes the full workbook later, so
+    this only has to be good enough to locate columns and section boundaries.
     """
     sample: Dict[str, Any] = {"file_type": ext, "sheets": []}
-    if ext == "csv":
-        df = pd.read_csv(io.BytesIO(raw_bytes), dtype=object, header=None)
-        sheets = {"CSV": df}
-    else:
-        engine = "openpyxl" if ext in {"xlsx", "xlsm"} else None
-        sheets = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=None, dtype=object, header=None, engine=engine)
+    sheets = read_all_sheets_from_bytes(raw_bytes, ext)
 
     for sheet_name, df in sheets.items():
+        total_rows = len(df)
+        ncols = min(last_used_column(df, cap=max_cols), max_cols)
+        windows = sample_row_windows(total_rows, head=max_rows - 20 if max_rows > 30 else max_rows)
         rows = []
-        nrows = min(len(df), max_rows)
-        ncols = min(len(df.columns), max_cols)
-        for r in range(nrows):
-            cells = []
-            for c in range(ncols):
-                val = cell_to_text(df.iat[r, c])
-                if val:
-                    cells.append({"r": r + 1, "c": c + 1, "col": index_to_excel_col(c), "v": val[:120]})
-            if cells:
-                rows.append({"row": r + 1, "cells": cells})
+        sampled_ranges = []
+        for window in windows:
+            sampled_ranges.append({"from_row": window.start + 1, "to_row": window.stop})
+            for r in window:
+                cells = []
+                for c in range(ncols):
+                    val = cell_to_text(df.iat[r, c])
+                    if val:
+                        cells.append({"r": r + 1, "c": c + 1, "col": index_to_excel_col(c), "v": val[:120]})
+                if cells:
+                    rows.append({"row": r + 1, "cells": cells})
         sample["sheets"].append({
             "sheet_name": str(sheet_name),
             "rows": rows,
-            "max_sampled_row": nrows,
+            "total_rows": total_rows,
+            "sampled_windows": sampled_ranges,
+            "max_sampled_row": total_rows,
             "max_sampled_col": ncols,
         })
     return sample
+
+
+def template_fingerprint(sample: Dict[str, Any]) -> str:
+    """Structure-only hash: same supplier template, different data -> same hash.
+
+    Deliberately excludes cell values below the header area so next month's price
+    list from the same supplier reuses the accepted plan instead of paying for a
+    fresh planner call (and possibly getting a slightly different answer).
+    """
+    parts: List[str] = [str(sample.get("file_type") or "")]
+    for sheet in sample.get("sheets", []):
+        header_text = []
+        for row in sheet.get("rows", [])[:12]:
+            header_text.append("|".join(normalise_for_compare(c.get("v")) for c in row.get("cells", [])))
+        parts.append(json.dumps({
+            "sheet": str(sheet.get("sheet_name") or ""),
+            "cols": sheet.get("max_sampled_col"),
+            "header": header_text,
+        }, sort_keys=True))
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
 
 
 def index_to_excel_col(idx: int) -> str:
@@ -3188,7 +3327,33 @@ def index_to_excel_col(idx: int) -> str:
     return letters
 
 
-def ai_layout_prompt(sample: Dict[str, Any], user_instructions: str = "") -> str:
+def _replan_feedback_block(previous_plan: Optional[Dict[str, Any]], audit_failures: Optional[List[str]]) -> str:
+    """Feedback appended on the second planning attempt.
+
+    Giving the model its own rejected plan plus the concrete audit failures is far
+    more effective than re-asking the same question and hoping for a different
+    answer.
+    """
+    if not previous_plan and not audit_failures:
+        return ""
+    return (
+        "\n\n=== SECOND ATTEMPT ===\n"
+        "Your previous plan was executed and failed a deterministic audit. "
+        "Fix the specific problems below. Do not repeat the same column choices.\n"
+        "Previous plan:\n" + json.dumps(safe_jsonable(previous_plan or {}), ensure_ascii=False) + "\n"
+        "Audit failures:\n- " + "\n- ".join(audit_failures or ["unknown"]) + "\n"
+        "Common causes: header_row off by one, start_row too high so early products were skipped, "
+        "a cost/ex-VAT column chosen as selling_price, side-by-side blocks read as one table, "
+        "or a variant export read as a standard table.\n"
+    )
+
+
+def ai_layout_prompt(
+    sample: Dict[str, Any],
+    user_instructions: str = "",
+    previous_plan: Optional[Dict[str, Any]] = None,
+    audit_failures: Optional[List[str]] = None,
+) -> str:
     return (
         "You are a retail spreadsheet layout planner for a Yoco POS import tool. "
         "You DO NOT extract all products. You only inspect the sampled rows and return a JSON extraction plan that Python can apply to the full workbook.\n\n"
@@ -3213,14 +3378,29 @@ def ai_layout_prompt(sample: Dict[str, Any], user_instructions: str = "") -> str
         "- If Column A contains a category that applies to following rows, use category_rule column_a_state.\n"
         "- Identify selling/retail/customer price, not cost/wholesale, unless wholesale is clearly the only customer price.\n"
         "- Product names containing x 6, x12, x 24, case, pack, pcs or units are case/pack rows. Do not mark them as normal variants; Python will flag them for user confirmation.\n"
-        "- If confidence is below 0.70, return layout_type unknown and explain why.\n\n"
+        "- If confidence is below 0.70, return layout_type unknown and explain why.\n"
+        "- VARIANTS: if one product spans several rows (repeated handle/slug/name with different option values), "
+        "set layout_type variant_export and fill the variant block. product_id must be the column that repeats per "
+        "product (handle, slug, or the product name column). attribute_1/value_1 are the option NAME and option VALUE "
+        "columns. If option names live in a header rather than a column, put the literal name in attribute_1 wrapped in "
+        "quotes, for example \"Size\".\n"
+        "- The sample contains a head window, mid-file windows and a tail window. Row numbers are absolute sheet rows. "
+        "Gaps between windows are unsampled rows, not blank rows.\n"
+        "- Fill description, brand and image_url columns when they exist; leave them empty strings otherwise.\n\n"
         "User/operator instructions to respect when choosing columns or category rules:\n"
         + (normalise_text(user_instructions) or "None")
+        + _replan_feedback_block(previous_plan, audit_failures)
         + "\n\nWorkbook sample:\n" + json.dumps(safe_jsonable(sample), ensure_ascii=False)
     )
 
 
-def call_gemini_layout_planner(sample: Dict[str, Any], api_key_override: str = "", user_instructions: str = "") -> Optional[Dict[str, Any]]:
+def call_gemini_layout_planner(
+    sample: Dict[str, Any],
+    api_key_override: str = "",
+    user_instructions: str = "",
+    previous_plan: Optional[Dict[str, Any]] = None,
+    audit_failures: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
     """Call Gemini if GEMINI_API_KEY is configured. Otherwise return None.
 
     The AI only returns a workbook layout plan. It does not extract products.
@@ -3243,7 +3423,12 @@ def call_gemini_layout_planner(sample: Dict[str, Any], api_key_override: str = "
         return None
 
     model = os.environ.get("GEMINI_LAYOUT_MODEL", "gemini-2.5-flash-preview-09-2025").strip() or "gemini-2.5-flash-preview-09-2025"
-    cache_key = hashlib.sha256(json.dumps({"sample": safe_jsonable(sample), "user_instructions": normalise_text(user_instructions)}, sort_keys=True).encode("utf-8")).hexdigest()
+    cache_key = hashlib.sha256(json.dumps({
+        "sample": safe_jsonable(sample),
+        "user_instructions": normalise_text(user_instructions),
+        "previous_plan": safe_jsonable(previous_plan or {}),
+        "audit_failures": sorted(audit_failures or []),
+    }, sort_keys=True).encode("utf-8")).hexdigest()
     if cache_key in _AI_LAYOUT_CACHE:
         return _AI_LAYOUT_CACHE[cache_key]
 
@@ -3253,7 +3438,12 @@ def call_gemini_layout_planner(sample: Dict[str, Any], api_key_override: str = "
 
     prompt = (
         "Return only strict JSON. No markdown, no prose.\n\n"
-        + ai_layout_prompt(sample, user_instructions=user_instructions)
+        + ai_layout_prompt(
+            sample,
+            user_instructions=user_instructions,
+            previous_plan=previous_plan,
+            audit_failures=audit_failures,
+        )
     )
 
     payload = {
@@ -3323,6 +3513,242 @@ def get_cell_by_plan(row: List[Any], col: Any) -> str:
     return cell_to_text(row[idx])
 
 
+def plan_cell(row: List[Any], col: Any) -> str:
+    """Read a planned column. Literal values in quotes are returned as-is.
+
+    The planner is allowed to answer attribute_1 with a literal such as "Size"
+    when the option name lives in a header rather than in a column.
+    """
+    text = normalise_text(col)
+    if not text:
+        return ""
+    if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
+        return text[1:-1].strip()
+    if column_letter_to_index(text) is None and not text.isdigit():
+        # Not a column reference at all; treat as a literal label.
+        return text
+    return get_cell_by_plan(row, text)
+
+
+def plan_money(row: List[Any], col: Any) -> Optional[float]:
+    text = normalise_text(col)
+    if not text:
+        return None
+    return parse_money_opt(get_cell_by_plan(row, text))
+
+
+_NON_PRODUCT_NAMES = {
+    "total", "totals", "subtotal", "sub total", "grand total", "sum", "vat", "vat total",
+    "discount", "balance", "amount due", "page total", "sheet total", "count", "average",
+    "product name", "description", "item", "price", "prices", "selling price", "cost price",
+}
+
+
+def _looks_like_non_product_name(name: str) -> bool:
+    """Reject totals rows and stray header repeats before they become products.
+
+    Conservative on purpose: only exact matches on a short list, plus long
+    sentence-like text with no price context. Anything ambiguous is kept and left
+    for the verification panel, because dropping a real product is worse than
+    surfacing a suspect one.
+    """
+    key = normalise_for_compare(name)
+    if not key:
+        return True
+    if key in _NON_PRODUCT_NAMES:
+        return True
+    if re.fullmatch(r"(sub\s*)?total[\s:.-]*", key):
+        return True
+    return False
+
+
+def _first_col(cols: Dict[str, Any], *names: str) -> Any:
+    for name in names:
+        value = cols.get(name)
+        if normalise_text(value):
+            return value
+    return ""
+
+
+def _row_from_plan_columns(
+    row: List[Any],
+    cols: Dict[str, Any],
+    sheet_name: str,
+    ridx: int,
+    category: str,
+) -> Optional[Dict[str, Any]]:
+    name = plan_cell(row, _first_col(cols, "product_name", "name", "title", "description"))
+    price = plan_money(row, _first_col(cols, "selling_price", "price", "sell", "retail"))
+    if not name or price is None or _looks_like_non_product_name(name):
+        return None
+    cost = plan_money(row, _first_col(cols, "cost_price", "cost")) or 0.0
+    code = plan_cell(row, _first_col(cols, "barcode", "sku", "code"))
+    description = plan_cell(row, cols.get("description")) if _first_col(cols, "product_name", "name", "title") else ""
+    return make_product_row(
+        product_name=clean_product_title(name),
+        category=category or sheet_name,
+        selling_price=price,
+        cost_price=cost,
+        barcode=code,
+        sku=code,
+        source_sheet=sheet_name,
+        source_row=ridx + 1,
+        description=description,
+        brand=plan_cell(row, cols.get("brand")),
+        image_url=plan_cell(row, cols.get("image_url")),
+    )
+
+
+def _extract_variant_export_with_plan(
+    df: pd.DataFrame,
+    sp: Dict[str, Any],
+    sheet_name: str,
+) -> List[Dict[str, Any]]:
+    """Plan-driven variant extraction.
+
+    One product spans several rows sharing a handle/slug/name; each row carries an
+    option value. Previously this layout fell through to the standard-table branch,
+    which emitted every variant row as its own single product and suffixed the
+    product_id — silently destroying variant grouping on every non-Shopify,
+    non-Yoco variant file.
+    """
+    variant = sp.get("variant") or {}
+    cols = sp.get("columns") or {}
+    header_row = int(sp.get("header_row") or 1)
+    start_row = int(sp.get("start_row") or (header_row + 1))
+
+    id_col = _first_col(variant, "product_id", "handle", "slug") or _first_col(cols, "product_id")
+    name_col = _first_col(cols, "product_name", "name", "title")
+    price_col = _first_col(variant, "price") or _first_col(cols, "selling_price", "price", "sell", "retail")
+    sku_col = _first_col(variant, "sku") or _first_col(cols, "barcode", "sku", "code")
+
+    axes = [
+        (variant.get("attribute_1"), variant.get("value_1")),
+        (variant.get("attribute_2"), variant.get("value_2")),
+        (variant.get("attribute_3"), variant.get("value_3")),
+    ]
+
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    order: List[str] = []
+    last_name = ""
+    last_key = ""
+
+    for ridx in range(max(0, start_row - 1), len(df)):
+        row = list(df.iloc[ridx].values)
+        raw_id = plan_cell(row, id_col) if id_col else ""
+        name = plan_cell(row, name_col) if name_col else ""
+        if name:
+            last_name = clean_product_title(name)
+        price = plan_money(row, price_col)
+
+        # Axis index is kept because exports such as Shopify only write the
+        # attribute NAME on the first row of a product. Yoco rejects an import
+        # where Attribute 1 differs between rows of the same product, so names are
+        # resolved per group after the scan.
+        axis_values: List[Tuple[int, str, str]] = []
+        for axis_idx, (attr_col, value_col) in enumerate(axes):
+            attr_name = plan_cell(row, attr_col) if attr_col else ""
+            attr_value = plan_cell(row, value_col) if value_col else ""
+            if attr_value:
+                axis_values.append((axis_idx, clean_product_title(attr_name), attr_value.strip()))
+
+        key = normalise_for_compare(raw_id) or normalise_for_compare(last_name) or last_key
+        if not key:
+            continue
+        if not axis_values and price is None:
+            continue
+        last_key = key
+
+        title = last_name or humanize_handle(raw_id)
+        if not title:
+            continue
+
+        entry = {
+            "title": title,
+            "handle": raw_id,
+            "price": price,
+            "code": plan_cell(row, sku_col) if sku_col else "",
+            "cost": plan_money(row, _first_col(cols, "cost_price", "cost")) or 0.0,
+            "category": plan_cell(row, cols.get("category")),
+            "description": plan_cell(row, cols.get("description")),
+            "brand": plan_cell(row, cols.get("brand")),
+            "image_url": plan_cell(row, cols.get("image_url")),
+            "axes": axis_values,
+            "row": ridx + 1,
+        }
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(entry)
+
+    products: List[Dict[str, Any]] = []
+    for key in order:
+        entries = groups[key]
+        priced = [e for e in entries if e["price"] is not None]
+        base_price = min((e["price"] for e in priced), default=0.0)
+        first = entries[0]
+        category = next((e["category"] for e in entries if e["category"]), "") or sheet_name
+        description = next((e["description"] for e in entries if e["description"]), "")
+        brand = next((e["brand"] for e in entries if e["brand"]), "")
+        image_url = next((e["image_url"] for e in entries if e["image_url"]), "")
+        variant_entries = [e for e in entries if e["axes"]]
+
+        if not variant_entries:
+            row_out = make_product_row(
+                product_name=first["title"],
+                category=category,
+                selling_price=base_price,
+                cost_price=first["cost"],
+                barcode=first["code"],
+                sku=first["code"],
+                source_sheet=sheet_name,
+                source_row=first["row"],
+                description=description,
+                brand=brand,
+                image_url=image_url,
+            )
+            products.append(row_out)
+            continue
+
+        product_id = slugify(first["handle"] or first["title"])
+        axis_names: Dict[int, str] = {}
+        for entry in variant_entries:
+            for axis_idx, attr_name, _value in entry["axes"]:
+                if attr_name and axis_idx not in axis_names:
+                    axis_names[axis_idx] = attr_name
+
+        seen_combos = set()
+        for entry in variant_entries:
+            combo = tuple((idx, v) for idx, _n, v in entry["axes"])
+            if combo in seen_combos:
+                continue
+            seen_combos.add(combo)
+            price = entry["price"] if entry["price"] is not None else base_price
+            row_out = make_product_row(
+                product_name=first["title"],
+                category=category,
+                selling_price=price,
+                cost_price=entry["cost"],
+                barcode=entry["code"],
+                sku=entry["code"],
+                source_sheet=sheet_name,
+                source_row=entry["row"],
+                description=description,
+                brand=brand,
+                image_url=entry["image_url"] or image_url,
+            )
+            row_out["product_id"] = product_id
+            row_out["variant_enabled"] = "Yes"
+            row_out["selling_price"] = base_price
+            row_out["calculated_price"] = price
+            row_out["variant_price"] = price
+            for slot, (axis_idx, _attr_name, attr_value) in enumerate(entry["axes"][:3], start=1):
+                row_out[f"attr{slot}_name"] = axis_names.get(axis_idx) or f"Option {axis_idx + 1}"
+                row_out[f"attr{slot}_val"] = attr_value
+            products.append(row_out)
+    return products
+
+
 def extract_products_with_ai_plan(raw_bytes: bytes, ext: str, plan: Dict[str, Any], parse_mode: str = "variant") -> List[Dict[str, Any]]:
     """Apply an AI layout plan to the full workbook using deterministic Python.
 
@@ -3332,11 +3758,7 @@ def extract_products_with_ai_plan(raw_bytes: bytes, ext: str, plan: Dict[str, An
     """
     if not plan or float(plan.get("confidence") or 0) < 0.70:
         return []
-    if ext == "csv":
-        sheets = {"CSV": pd.read_csv(io.BytesIO(raw_bytes), dtype=object, header=None)}
-    else:
-        engine = "openpyxl" if ext in {"xlsx", "xlsm"} else None
-        sheets = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=None, dtype=object, header=None, engine=engine)
+    sheets = read_all_sheets_from_bytes(raw_bytes, ext)
 
     sheet_plans = {str(sp.get("sheet_name", "")): sp for sp in plan.get("sheets", []) if isinstance(sp, dict)}
     products: List[Dict[str, Any]] = []
@@ -3351,6 +3773,9 @@ def extract_products_with_ai_plan(raw_bytes: bytes, ext: str, plan: Dict[str, An
                 continue
         layout_type = sp.get("layout_type") or plan.get("layout_type") or "standard_table"
         tables = sp.get("tables") or []
+        variant_plan = sp.get("variant") or {}
+        variant_enabled = bool(variant_plan.get("enabled")) or layout_type == "variant_export"
+
         if layout_type == "side_by_side_tables" and tables:
             for table in tables:
                 cols = table.get("columns") or {}
@@ -3358,23 +3783,13 @@ def extract_products_with_ai_plan(raw_bytes: bytes, ext: str, plan: Dict[str, An
                 category = cell_to_text(table.get("category") or "")
                 for ridx in range(max(0, start_row - 1), len(df)):
                     row = list(df.iloc[ridx].values)
-                    name = get_cell_by_plan(row, cols.get("product_name") or cols.get("name") or cols.get("description"))
-                    price = parse_money(get_cell_by_plan(row, cols.get("selling_price") or cols.get("price") or cols.get("sell")))
-                    if not name or price is None:
-                        continue
-                    code = get_cell_by_plan(row, cols.get("barcode") or cols.get("sku") or cols.get("code"))
-                    cost = parse_money(get_cell_by_plan(row, cols.get("cost_price") or cols.get("cost"))) or 0
-                    title = clean_product_title(name)
-                    products.append(make_product_row(
-                        product_name=title,
-                        category=category or str(sheet_name),
-                        selling_price=price,
-                        cost_price=cost,
-                        barcode=code,
-                        sku=code,
-                        source_sheet=str(sheet_name),
-                        source_row=ridx + 1,
-                    ))
+                    built = _row_from_plan_columns(row, cols, str(sheet_name), ridx, category)
+                    if built:
+                        products.append(built)
+            continue
+
+        if variant_enabled and (variant_plan.get("value_1") or variant_plan.get("product_id")):
+            products.extend(_extract_variant_export_with_plan(df, sp, str(sheet_name)))
             continue
 
         if layout_type in {"standard_table", "category_blocks", "headerless_price_list", "variant_export"}:
@@ -3385,37 +3800,305 @@ def extract_products_with_ai_plan(raw_bytes: bytes, ext: str, plan: Dict[str, An
             active_category = ""
             for ridx in range(max(0, start_row - 1), len(df)):
                 row = list(df.iloc[ridx].values)
-                cat_cell = get_cell_by_plan(row, cols.get("category"))
-                name = get_cell_by_plan(row, cols.get("product_name") or cols.get("description") or cols.get("name"))
-                price = parse_money(get_cell_by_plan(row, cols.get("selling_price") or cols.get("price") or cols.get("sell")))
-                cost = parse_money(get_cell_by_plan(row, cols.get("cost_price") or cols.get("cost"))) or 0
-                code = get_cell_by_plan(row, cols.get("barcode") or cols.get("sku") or cols.get("code"))
+                cat_cell = plan_cell(row, cols.get("category"))
+                name = plan_cell(row, _first_col(cols, "product_name", "description", "name", "title"))
+                price = plan_money(row, _first_col(cols, "selling_price", "price", "sell", "retail"))
+                cost = plan_money(row, _first_col(cols, "cost_price", "cost"))
+                code = plan_cell(row, _first_col(cols, "barcode", "sku", "code"))
 
                 if category_rule == "column_a_state" and cat_cell:
                     active_category = clean_product_title(cat_cell)
+                # Category heading row: a name with no price, no code and no cost.
+                # parse_money() used to return 0.0 here instead of None, so this
+                # branch never fired and category-block sheets lost their sections.
                 if name and price is None and not code and not cost and category_rule in {"column_a_state", "header_blocks"}:
                     active_category = clean_product_title(name)
                     continue
-                if not name or price is None:
+                if not name or price is None or _looks_like_non_product_name(name):
                     continue
                 category = cat_cell if category_rule == "none" else (active_category or cat_cell)
                 title = clean_product_title(name)
-                if category and category_rule in {"column_a_state", "header_blocks"}:
-                    # Prefix only when the title does not already contain the category.
-                    if category.lower() not in title.lower():
-                        title = f"{category} - {title}"
+                # The category already travels in its own column, so the name is
+                # left clean by default. Set PREFIX_CATEGORY_IN_NAME=true to restore
+                # the older "CATEGORY - Product" naming.
+                if (
+                    category
+                    and category_rule in {"column_a_state", "header_blocks"}
+                    and os.environ.get("PREFIX_CATEGORY_IN_NAME", "").lower() in {"1", "true", "yes"}
+                    and category.lower() not in title.lower()
+                ):
+                    title = f"{category} - {title}"
                 products.append(make_product_row(
                     product_name=title,
                     category=category or str(sheet_name),
                     selling_price=price,
-                    cost_price=cost,
+                    cost_price=cost or 0.0,
                     barcode=code,
                     sku=code,
                     source_sheet=str(sheet_name),
                     source_row=ridx + 1,
+                    description=plan_cell(row, cols.get("description")) if _first_col(cols, "product_name", "name", "title") else "",
+                    brand=plan_cell(row, cols.get("brand")),
+                    image_url=plan_cell(row, cols.get("image_url")),
                 ))
     return products
 
+
+
+_HEADER_WORD_HINTS = {
+    "price", "prices", "description", "product", "code", "barcode", "sku", "total",
+    "qty", "quantity", "cost", "vat", "excl", "incl", "retail", "sell", "selling",
+    "item", "stock", "category", "brand", "unit", "margin", "subtotal", "grand",
+}
+
+
+def _row_is_candidate_product(values: List[Any]) -> bool:
+    """Deterministic 'this row looks like a product' test used only for auditing.
+
+    A candidate row has at least one text cell of real length and at least one
+    positive money-like cell. It is intentionally simple: the point is to have an
+    independent denominator that does not depend on the AI plan being right.
+    """
+    has_text = False
+    has_money = False
+    header_hits = 0
+    for value in values:
+        text = cell_to_text(value)
+        if not text:
+            continue
+        money = parse_money_opt(value)
+        if money is not None and money > 0:
+            has_money = True
+            continue
+        if len(text) >= 3 and re.search(r"[A-Za-z]{3}", text):
+            has_text = True
+            if normalise_for_compare(text) in _HEADER_WORD_HINTS:
+                header_hits += 1
+    return has_text and has_money and header_hits < 2
+
+
+def count_candidate_rows(raw_bytes: bytes, ext: str) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    try:
+        sheets = read_all_sheets_from_bytes(raw_bytes, ext)
+    except Exception:
+        return counts
+    for sheet_name, df in sheets.items():
+        total = 0
+        for ridx in range(len(df)):
+            if _row_is_candidate_product(list(df.iloc[ridx].values)):
+                total += 1
+        counts[str(sheet_name)] = total
+    return counts
+
+
+def audit_extraction(
+    raw_bytes: bytes,
+    ext: str,
+    products: List[Dict[str, Any]],
+    candidate_counts: Optional[Dict[str, int]] = None,
+    mode: str = "table",
+) -> Dict[str, Any]:
+    """Score an extraction without calling any model.
+
+    This is the safety net that makes the Render path trustworthy: it answers
+    "did we lose rows?", "did we grab the cost column?" and "are the variants
+    importable?" before the user ever sees the table.
+    """
+    counts = candidate_counts if candidate_counts is not None else count_candidate_rows(raw_bytes, ext)
+    candidate_total = sum(counts.values())
+    emitted_total = len(products)
+
+    per_sheet: Dict[str, Any] = {}
+    emitted_by_sheet: Dict[str, int] = {}
+    for row in products:
+        key = str(row.get("source_sheet") or "")
+        emitted_by_sheet[key] = emitted_by_sheet.get(key, 0) + 1
+    for sheet_name, candidates in counts.items():
+        emitted = emitted_by_sheet.get(sheet_name, 0)
+        per_sheet[sheet_name] = {
+            "candidate_rows": candidates,
+            "emitted_rows": emitted,
+            "coverage": round(min(emitted / candidates, 1.0), 4) if candidates else (1.0 if emitted else 0.0),
+        }
+
+    # Side-by-side layouts legitimately yield 2+ products per source row, so the
+    # ratio is capped for pass/fail purposes. Coverage only ever catches
+    # UNDER-extraction (rows silently lost); over-extraction is caught separately
+    # by the inflation check below.
+    row_ratio = round(emitted_total / candidate_total, 4) if candidate_total else 0.0
+    coverage = round(min(row_ratio, 1.0), 4) if candidate_total else (1.0 if emitted_total else 0.0)
+
+    zero_price = [r for r in products if parse_money(r.get("calculated_price") or r.get("selling_price")) <= 0]
+    junk = [
+        r for r in zero_price
+        if len(normalise_text(r.get("product_name")).split()) > 6
+    ]
+    price_below_cost = [
+        r for r in products
+        if parse_money(r.get("cost_price")) > 0
+        and parse_money(r.get("calculated_price") or r.get("selling_price")) > 0
+        and parse_money(r.get("calculated_price") or r.get("selling_price")) < parse_money(r.get("cost_price"))
+    ]
+    variant_rows = [r for r in products if normalise_text(r.get("variant_enabled")).lower() == "yes"]
+    broken_variants = [r for r in variant_rows if not normalise_text(r.get("attr1_val"))]
+
+    code_counts: Dict[str, int] = {}
+    for row in products:
+        code = clean_code(row.get("barcode") or row.get("sku"))
+        if code:
+            code_counts[code] = code_counts.get(code, 0) + 1
+    duplicate_codes = sum(1 for c, n in code_counts.items() if n > 1)
+    coded_products = sum(code_counts.values()) or 1
+
+    identity_counts: Dict[Tuple[str, ...], int] = {}
+    for row in products:
+        identity = (
+            normalise_for_compare(row.get("product_name")),
+            "|".join(
+                normalise_for_compare(row.get(f"attr{i}_val"))
+                for i in (1, 2, 3)
+            ),
+            f"{parse_money(row.get('calculated_price') or row.get('selling_price')):.2f}",
+        )
+        identity_counts[identity] = identity_counts.get(identity, 0) + 1
+    repeated = sum(n - 1 for n in identity_counts.values() if n > 1)
+
+    metrics = {
+        "coverage": coverage,
+        "row_ratio": row_ratio,
+        "repeated_row_rate": round(repeated / emitted_total, 4) if emitted_total else 0.0,
+        "candidate_rows": candidate_total,
+        "emitted_rows": emitted_total,
+        "zero_price_rate": round(len(zero_price) / emitted_total, 4) if emitted_total else 0.0,
+        "junk_rate": round(len(junk) / emitted_total, 4) if emitted_total else 0.0,
+        "price_below_cost_rate": round(len(price_below_cost) / emitted_total, 4) if emitted_total else 0.0,
+        "duplicate_code_rate": round(duplicate_codes / coded_products, 4),
+        "variant_rows": len(variant_rows),
+        "broken_variant_rows": len(broken_variants),
+        "per_sheet": per_sheet,
+    }
+
+    failures: List[str] = []
+    if emitted_total == 0:
+        failures.append("No products extracted at all.")
+    # Pre-exploded exports (Shopify image rows, Yoco variant rows) legitimately
+    # collapse several source rows into one product, so they get a floor instead of
+    # a 90% target.
+    coverage_floor = 0.30 if mode == "structured" else 0.90
+    if candidate_total and coverage < coverage_floor:
+        failures.append(
+            f"Coverage {coverage:.0%}: {emitted_total} rows extracted from about {candidate_total} "
+            f"candidate source rows. Likely a start_row set too high, a missed sheet, or a second "
+            f"table further down the sheet."
+        )
+    if emitted_total and row_ratio > 3.0 and metrics["repeated_row_rate"] > 0.25:
+        failures.append(
+            f"Extracted {row_ratio:.1f}x more rows than source rows with {metrics['repeated_row_rate']:.0%} "
+            f"exact repeats — the same rows are probably being read twice (overlapping table blocks)."
+        )
+    if emitted_total and metrics["price_below_cost_rate"] > 0.20:
+        failures.append(
+            "Selling price is below cost on more than 20% of rows — the cost/ex-VAT column was "
+            "probably chosen as selling_price."
+        )
+    if emitted_total and metrics["junk_rate"] > 0.05:
+        failures.append(
+            "More than 5% of rows have no price and a long sentence-like name — heading, note or "
+            "footer rows are being read as products."
+        )
+    if emitted_total and metrics["duplicate_code_rate"] > 0.10:
+        failures.append(
+            "More than 10% of barcodes are duplicated — the code column may be a category or "
+            "line-number column."
+        )
+    if broken_variants:
+        failures.append(
+            f"{len(broken_variants)} variant rows have no Value 1 — Yoco will reject the import."
+        )
+
+    metrics["failures"] = failures
+    metrics["passed"] = not failures
+    # A single score so two candidate extractions can be compared objectively.
+    metrics["score"] = round(
+        min(coverage, 1.5)
+        - metrics["junk_rate"]
+        - metrics["price_below_cost_rate"]
+        - (0.5 if broken_variants else 0.0),
+        4,
+    )
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# Template plan registry
+# ---------------------------------------------------------------------------
+# Same supplier template, different data -> reuse the accepted plan with zero
+# model calls. This is what makes repeat runs byte-for-byte identical instead of
+# "slightly different every time".
+_PLAN_REGISTRY: Dict[str, Dict[str, Any]] = {}
+
+
+def _plan_registry_path() -> Optional[str]:
+    path = normalise_text(os.environ.get("PLAN_REGISTRY_PATH", "/tmp/yoco_plan_registry.json"))
+    return path or None
+
+
+def _load_plan_registry() -> None:
+    if _PLAN_REGISTRY:
+        return
+    path = _plan_registry_path()
+    if not path or not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            _PLAN_REGISTRY.update(data)
+    except Exception as exc:
+        app.logger.warning("Plan registry unreadable: %s", exc)
+
+
+def _save_plan_registry() -> None:
+    path = _plan_registry_path()
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(_PLAN_REGISTRY, handle)
+    except Exception as exc:
+        app.logger.warning("Plan registry not saved: %s", exc)
+
+
+def get_registered_plan(fingerprint: str) -> Optional[Dict[str, Any]]:
+    if not fingerprint or os.environ.get("PLAN_REGISTRY_DISABLED", "").lower() in {"1", "true", "yes"}:
+        return None
+    _load_plan_registry()
+    entry = _PLAN_REGISTRY.get(fingerprint)
+    if isinstance(entry, dict) and isinstance(entry.get("plan"), dict):
+        return entry["plan"]
+    return None
+
+
+def register_plan(fingerprint: str, plan: Dict[str, Any], audit: Dict[str, Any], filename: str = "") -> None:
+    if not fingerprint or not plan:
+        return
+    if os.environ.get("PLAN_REGISTRY_DISABLED", "").lower() in {"1", "true", "yes"}:
+        return
+    _load_plan_registry()
+    _PLAN_REGISTRY[fingerprint] = {
+        "plan": plan,
+        "coverage": audit.get("coverage"),
+        "score": audit.get("score"),
+        "source_filename": filename,
+        "app_version": APP_VERSION,
+    }
+    _save_plan_registry()
+
+
+def forget_plan(fingerprint: str) -> bool:
+    _load_plan_registry()
+    return _PLAN_REGISTRY.pop(fingerprint, None) is not None
 
 
 def parse_known_structured_export_from_bytes(raw_bytes: bytes, ext: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -4070,26 +4753,116 @@ def parse_uploaded_file_ai_assisted(file_storage, parse_mode: str = "variant", g
     # product-level fields are not mistaken for non-variant/detail rows.
     structured_products, structured_meta = parse_known_structured_export_from_bytes(raw_bytes, ext)
     if structured_products:
-        return structured_products, structured_meta
+        candidates = count_candidate_rows(raw_bytes, ext)
+        audit = audit_extraction(raw_bytes, ext, structured_products, candidate_counts=candidates, mode="structured")
+        meta = dict(structured_meta or {})
+        meta.update({"audit": audit, "coverage": audit.get("coverage"), "planner_calls": 0, "replans": 0})
+        return structured_products, meta
 
     sample = workbook_sample_from_bytes(raw_bytes, ext)
-    plan = call_gemini_layout_planner(sample, api_key_override=gemini_api_key, user_instructions=user_instructions)
-    ai_products: List[Dict[str, Any]] = []
-    if plan:
-        ai_products = extract_products_with_ai_plan(raw_bytes, ext, plan, parse_mode=parse_mode)
-    if ai_products:
-        return ai_products, {"layout_strategy": "ai_plan", "layout_plan": plan, "ai_rows": len(ai_products)}
+    fingerprint = template_fingerprint(sample)
+    candidate_counts = count_candidate_rows(raw_bytes, ext)
+    planner_calls = 0
+    attempts: List[Dict[str, Any]] = []
 
-    # Fallback: feed a fresh in-memory file to the existing Python parser.
+    def try_plan(plan: Optional[Dict[str, Any]], strategy: str) -> Optional[Dict[str, Any]]:
+        if not plan:
+            return None
+        rows = extract_products_with_ai_plan(raw_bytes, ext, plan, parse_mode=parse_mode)
+        if not rows:
+            return None
+        audit = audit_extraction(raw_bytes, ext, rows, candidate_counts=candidate_counts)
+        result = {"strategy": strategy, "plan": plan, "products": rows, "audit": audit}
+        attempts.append(result)
+        return result
+
+    # 1. Known template: execute the stored plan with no model call at all.
+    registered = get_registered_plan(fingerprint)
+    best = try_plan(registered, "registered_plan")
+    if best and best["audit"].get("passed"):
+        return best["products"], {
+            "layout_strategy": "registered_plan",
+            "layout_plan": best["plan"],
+            "template_fingerprint": fingerprint,
+            "ai_rows": len(best["products"]),
+            "planner_calls": 0,
+            "replans": 0,
+            "coverage": best["audit"].get("coverage"),
+            "audit": best["audit"],
+        }
+
+    # 2. Plan, execute, audit.
+    plan = call_gemini_layout_planner(sample, api_key_override=gemini_api_key, user_instructions=user_instructions)
+    planner_calls += 1 if plan else 0
+    first = try_plan(plan, "ai_plan")
+
+    # 3. One re-plan attempt, fed the previous plan and the concrete audit failures.
+    if plan and (not first or not first["audit"].get("passed")):
+        failures = first["audit"].get("failures") if first else ["Plan produced no rows."]
+        replan = call_gemini_layout_planner(
+            sample,
+            api_key_override=gemini_api_key,
+            user_instructions=user_instructions,
+            previous_plan=plan,
+            audit_failures=failures,
+        )
+        if replan:
+            planner_calls += 1
+            try_plan(replan, "ai_plan_replan")
+
+    # 4. Legacy heuristics as a third candidate, scored on the same scale.
     from werkzeug.datastructures import FileStorage
-    fallback_file = FileStorage(stream=io.BytesIO(raw_bytes), filename=filename)
-    fallback_products = parse_uploaded_file(fallback_file)
-    return fallback_products, {
-        "layout_strategy": "python_fallback",
-        "layout_plan": plan,
-        "ai_rows": 0,
+    fallback_products: List[Dict[str, Any]] = []
+    try:
+        fallback_file = FileStorage(stream=io.BytesIO(raw_bytes), filename=filename)
+        fallback_products = parse_uploaded_file(fallback_file)
+    except Exception as exc:
+        app.logger.warning("Legacy parser failed: %s", exc)
+    if fallback_products:
+        attempts.append({
+            "strategy": "python_fallback",
+            "plan": None,
+            "products": fallback_products,
+            "audit": audit_extraction(raw_bytes, ext, fallback_products, candidate_counts=candidate_counts),
+        })
+
+    if not attempts:
+        return [], {
+            "layout_strategy": "none",
+            "layout_plan": plan,
+            "template_fingerprint": fingerprint,
+            "planner_calls": planner_calls,
+            "replans": max(0, planner_calls - 1),
+            "ai_rows": 0,
+            "fallback_rows": 0,
+            "audit": audit_extraction(raw_bytes, ext, [], candidate_counts=candidate_counts),
+            "ai_available": bool(
+                os.environ.get("GEMINI_API_KEY", "").strip()
+                or os.environ.get("GOOGLE_API_KEY", "").strip()
+                or os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY", "").strip()
+                or os.environ.get("API_KEY", "").strip()
+            ),
+        }
+
+    # Pick the highest-scoring candidate rather than trusting a fixed order.
+    winner = max(attempts, key=lambda a: (a["audit"].get("score") or 0, len(a["products"])))
+    if winner["plan"] and winner["audit"].get("passed"):
+        register_plan(fingerprint, winner["plan"], winner["audit"], filename=filename)
+
+    return winner["products"], {
+        "layout_strategy": winner["strategy"],
+        "layout_plan": winner["plan"],
+        "template_fingerprint": fingerprint,
+        "ai_rows": len(winner["products"]) if winner["strategy"] != "python_fallback" else 0,
         "fallback_rows": len(fallback_products),
-        "ai_available": bool((os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip() or os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY", "").strip() or os.environ.get("API_KEY", "").strip())),
+        "planner_calls": planner_calls,
+        "replans": max(0, planner_calls - 1),
+        "coverage": winner["audit"].get("coverage"),
+        "audit": winner["audit"],
+        "attempts": [
+            {"strategy": a["strategy"], "rows": len(a["products"]), "score": a["audit"].get("score"), "coverage": a["audit"].get("coverage")}
+            for a in attempts
+        ],
     }
 
 def parse_uploaded_file(file_storage) -> List[Dict[str, Any]]:
@@ -4199,10 +4972,12 @@ def product_to_yoco_row(row: Dict[str, Any], track_stock: str = "Product", vat_e
         "Category": normalise_text(row.get("category") or row.get("Category")) or "Uncategorised",
         "SKU": normalise_text(row.get("sku") or row.get("SKU") or code),
         "Default Cost Price": cost,
-        "Ask For Quantity": "No",
+        # Blank means "use the Yoco default". Only populate these when the
+        # behaviour is actually wanted, per the product import guide.
+        "Ask For Quantity": normalise_text(row.get("ask_for_quantity") or row.get("Ask For Quantity")),
         "Default Quantity": default_quantity,
         "Quantity Units": normalise_text(row.get("quantity_units") or row.get("Quantity Units")),
-        "Ask For Price": "No",
+        "Ask For Price": normalise_text(row.get("ask_for_price") or row.get("Ask For Price")),
         "VAT Enabled": normalise_text(row.get("vat_enabled") or row.get("VAT Enabled")) or vat_enabled,
         "Variant Price": variant_price,
         "Variant Enabled": variant_enabled,
@@ -4573,6 +5348,75 @@ def health_check():
 @app.get("/health")
 def health():
     return jsonify({"status": "ok", "service": "Yoco retail file processor", "version": APP_VERSION})
+
+
+@app.get("/dashboard")
+def dashboard():
+    """Serve the RetailScan dashboard from this service.
+
+    Handy for testing without a separate static host: the page can then call the
+    API on its own origin, sidestepping CORS entirely.
+    """
+    from flask import send_from_directory
+    return send_from_directory(app.static_folder, "index.html")
+
+
+@app.get("/template-columns")
+def template_columns():
+    """The exact Yoco import column order this service writes.
+
+    Documented in the README but never actually implemented, so it 404'd. Useful
+    for a client that wants to build or validate a file without guessing at the
+    column order — Yoco rejects reordered or missing columns.
+    """
+    return cors_json({
+        "columns": YOCO_PRODUCTS_COLUMNS,
+        "count": len(YOCO_PRODUCTS_COLUMNS),
+        "required": ["Product Name", "Default Price"],
+        "sheet_name": "Products",
+        "notes": {
+            "Ask For Quantity": "Blank uses the Yoco default; only set Yes/No deliberately.",
+            "Ask For Price": "Blank uses the Yoco default.",
+            "Track Stock": "No | Product | Variant. Legacy Yes behaves like Product.",
+            "Variant Enabled": "Only meaningful on rows carrying an Attribute/Value pair.",
+            "Default Price": "Must be identical on every row of a variant product.",
+        },
+        "version": APP_VERSION,
+    })
+
+
+@app.get("/plan-registry")
+def plan_registry_list():
+    """Inspect stored template plans. Keys are structure-only fingerprints."""
+    _load_plan_registry()
+    return cors_json({
+        "count": len(_PLAN_REGISTRY),
+        "registry_path": _plan_registry_path(),
+        "entries": [
+            {
+                "fingerprint": key,
+                "coverage": entry.get("coverage"),
+                "score": entry.get("score"),
+                "source_filename": entry.get("source_filename"),
+                "layout_type": (entry.get("plan") or {}).get("layout_type"),
+                "app_version": entry.get("app_version"),
+            }
+            for key, entry in _PLAN_REGISTRY.items()
+        ],
+    })
+
+
+@app.post("/plan-registry/forget")
+def plan_registry_forget():
+    """Drop a stored plan so the next upload of that template is re-planned."""
+    payload = request.get_json(silent=True) or {}
+    fingerprint = normalise_text(payload.get("fingerprint"))
+    if not fingerprint:
+        return cors_json({"error": "fingerprint is required"}, 400)
+    removed = forget_plan(fingerprint)
+    if removed:
+        _save_plan_registry()
+    return cors_json({"ok": True, "removed": removed})
 
 
 

@@ -4,11 +4,30 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --timeout 120
+    startCommand: gunicorn app:app --timeout 180
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.9
+        value: 3.12.8
+      # Yoco accepts files up to ~32 MB; matching that avoids rejecting a file
+      # here that the POS itself would have accepted.
       - key: MAX_UPLOAD_MB
-        value: 25
+        value: 32
+      # Replace with your dashboard domain before this handles client catalogues.
       - key: ALLOWED_ORIGINS
         value: "*"
+      - key: GEMINI_LAYOUT_MODEL
+        value: gemini-2.5-flash-preview-09-2025
+      # Accepted layout plans are cached here and reused for the same template.
+      # Render's disk is ephemeral, so the registry warms up again after a deploy.
+      - key: PLAN_REGISTRY_PATH
+        value: /tmp/yoco_plan_registry.json
+      # Category already travels in its own column; set true to restore the
+      # legacy "CATEGORY - Product" naming.
+      - key: PREFIX_CATEGORY_IN_NAME
+        value: "false"
+      - key: DRIVE_UPLOAD_REQUIRED
+        value: "false"
+      # Set these in the Render dashboard, not here, so no secret lands in the repo:
+      #   GEMINI_API_KEY               layout planner (without it: deterministic parsers only)
+      #   GOOGLE_SERVICE_ACCOUNT_JSON  upload backup to Drive
+      #   GOOGLE_SHARED_DRIVE_ID / GOOGLE_DRIVE_FOLDER_ID

@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+# Supplier price lists and their snapshot are client data — keep them local.
+tests/goldens/files/*
+!tests/goldens/files/.gitkeep
+tests/goldens/expected.json
+yoco_plan_registry.json
